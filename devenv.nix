@@ -14,9 +14,14 @@
 
   packages = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
     pkgs.cargo-xwin
-    pkgs.fuse3.bin
     pkgs.llvmPackages.llvm
   ];
+
+  env.FUSERMOUNT_PATH = "/run/wrappers/bin/fusermount3";
+
+  enterShell = ''
+    export PATH="/run/wrappers/bin:$PATH"
+  '';
 
   git-hooks.hooks = {
     rustfmt.enable = true;
