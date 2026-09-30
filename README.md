@@ -1,7 +1,8 @@
 # FeishuFS
 
-将飞书/Lark 知识库节点挂载为本地**只读文件系统**，让编辑器、搜索工具、脚本和 AI 工具通过普通文件 API 读取云文档。
+将飞书/Lark 知识库挂载为本地**只读文件系统**，让编辑器、搜索工具、脚本和 AI 工具通过普通文件 API 读取云文档。
 
+- 输入知识库空间内任意一个文档链接，挂载该文档所在的**整个知识库**
 - Linux：FSK + FUSE
 - Windows：FSK + ProjFS
 - 飞书 API：[OpenLark `0.20.0`](https://docs.rs/openlark-docs/0.20.0/openlark_docs/)
@@ -12,34 +13,32 @@
 
 ## 文件映射
 
-输入链接指向的节点直接成为挂载根。每个知识库节点映射为目录，节点内容位于该目录的 `index.*`：
+挂载根就是知识库空间目录。节点按**有没有子页面**决定形态：有子页面的文档映射为目录，正文在 `index.*`，子页面在目录内；没有子页面的文档直接映射为同级文件。
 
 ```text
-<mountpoint>/
-├── index.md
-├── 快速开始/
+<mountpoint>/            ← 整个知识库空间
+├── 快速开始/            ← 有子页面的文档
 │   ├── index.md
-│   └── API 说明/
+│   ├── API 说明.md      ← 没有子页面的文档
+│   └── 常见问题/
 │       └── index.md
-├── 数据报表/
-│   └── index.xlsx
-└── 附件/
-    └── index.pdf
+├── 数据报表.xlsx        ← 没有子页面的表格
+└── 附件.pdf
 ```
 
-| 飞书对象 | 本地内容 |
-| --- | --- |
-| `docx` | `index.md` |
-| 旧版 `doc` | 导出的 `index.docx` |
-| `sheet` / `bitable` | 导出的 `index.xlsx` |
-| `file` | 原始下载内容 `index.<扩展名>` |
-| 暂不支持的类型 | 说明原因和云端链接的 `index.md` |
+| 飞书对象 | 有子页面 | 没有子页面 |
+| --- | --- | --- |
+| `docx` | `标题/index.md` | `标题.md` |
+| 旧版 `doc` | `标题/index.docx` | `标题.docx` |
+| `sheet` / `bitable` | `标题/index.xlsx` | `标题.xlsx` |
+| `file` | `标题/index.<扩展名>` | `标题.<扩展名>` |
+| 暂不支持的类型 | `标题/index.md` | `标题.md`（说明原因和云端链接） |
 
 文件名会清理跨平台非法字符、Windows 设备名和大小写不敏感的同级冲突。inode 在一次挂载期间保持稳定且不复用。
 
 ### 文档内链接
 
-飞书正文里指向挂载子树内节点的链接会被改写成相对的本地 Markdown 链接，例如 `[API](<快速开始/API 说明/index.md>)`。指向子树外、非飞书域名或未知节点的链接保持原样；围栏代码块、缩进代码块和行内代码中的示例链接不改写。云端改名或移动节点后，下一次目录刷新会用缓存的原始 Markdown 重新渲染链接，无需重新下载正文。
+飞书正文里指向挂载范围内其它文档的链接会被改写成相对的本地 Markdown 链接，例如 `[API](<../快速开始/常见问题/index.md>)`、`[说明](<API 说明.md>)`。指向范围外、非飞书域名或未知节点的链接保持原样；围栏代码块、缩进代码块和行内代码中的示例链接不改写。云端改名或移动节点后，下一次目录刷新会用缓存的原始 Markdown 重新渲染链接，无需重新下载正文。
 
 ## 前置条件
 
@@ -84,7 +83,17 @@ ProjFS 是投影缓存而非 FUSE 的完全等价物。FeishuFS 会拒绝覆盖�
 先检查权限和映射：
 
 ```bash
+# 链接可以是空间内任意一个文档（wiki / docx / sheet / ... 路径均可）
 cargo run -- inspect 'https://example.feishu.cn/wiki/wikcnxxx'
+```
+
+输出的是该文档所在整个知识库的目录预览。链接中的文档不需要是空间首页，也不影响挂载根：
+
+```text
+知识库：<空间名称>
+节点数：<可见文档数>
+映射预览：
+  ...
 ```
 
 再以前台进程挂载：
@@ -100,7 +109,7 @@ cargo run -- mount 'https://example.feishu.cn/wiki/wikcnxxx' ./mnt
 
 ```text
 --refresh-interval 60s   目录与内容缓存周期
---max-nodes 10000        单次挂载节点上限
+--max-nodes 10000        单次挂载的文档数上限
 --max-download-mib 100   单文件下载/导出上限
 --request-timeout 30s    OpenAPI 请求超时
 -v / -vv                 debug / trace 日志

@@ -161,9 +161,10 @@ impl FeishuFs {
         self.inner.state.read().root_title.clone()
     }
 
+    /// Number of knowledge-base documents in the current snapshot.
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.inner.state.read().nodes.len().div_ceil(2)
+        self.inner.state.read().document_count
     }
 
     #[must_use]
@@ -547,16 +548,21 @@ fn platform_name_eq(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use std::thread;
 
-    use crate::remote::test_support::{FakeSource, node};
+    use crate::remote::test_support::{FakeSource, leaf, node};
 
     use super::*;
 
+    /// A space whose only top-level document is a childless `Guide` doc.
     fn test_fs(cache_ttl: Duration) -> (FeishuFs, FakeSource) {
-        let source = FakeSource::with_root(node("root", "Root", "docx"));
+        let source = FakeSource::with_root(node("root", "Team Wiki", "docx"));
+        source
+            .children
+            .lock()
+            .insert("space-1".into(), vec![leaf("one", "Guide", "docx")]);
         source
             .content
             .lock()
-            .insert("obj-root".into(), Ok(b"# Root\n".to_vec()));
+            .insert("obj-one".into(), Ok(b"# Guide\n".to_vec()));
         let link = "https://example.feishu.cn/wiki/root".parse().unwrap();
         let filesystem = FeishuFs::connect(
             Arc::new(source.clone()),
@@ -573,12 +579,15 @@ mod tests {
     #[test]
     fn reads_markdown_and_rejects_writes() {
         let (filesystem, _) = test_fs(Duration::from_secs(60));
-        let (inode, kind) = filesystem.lookup(ROOT_INODE, b"index.md").unwrap();
+        assert_eq!(filesystem.root_title(), "Team Wiki");
+        assert_eq!(filesystem.node_count(), 1);
+
+        let (inode, kind) = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap();
         assert_eq!(kind, FileType::File);
-        assert_eq!(filesystem.metadata(inode).unwrap().size, 7);
+        assert_eq!(filesystem.metadata(inode).unwrap().size, 8);
         let mut output = [0_u8; 32];
         let count = filesystem.read(inode, 0, &mut output).unwrap();
-        assert_eq!(&output[..count], b"# Root\n");
+        assert_eq!(&output[..count], b"# Guide\n");
         assert_eq!(filesystem.write(inode, 0, b"no"), Err(ACCESS_DENIED));
         assert_eq!(
             filesystem.create(ROOT_INODE, b"new", FileType::File, 0o644),
@@ -589,28 +598,46 @@ mod tests {
     #[test]
     fn rewrites_links_into_mounted_subtree() {
         let (filesystem, source) = test_fs(Duration::from_secs(60));
+        // "Root" gains a child page, so it becomes a directory with index.md.
+        source.children.lock().insert(
+            "space-1".into(),
+            vec![
+                node("root", "Root", "docx"),
+                leaf("sibling", "Sibling", "docx"),
+            ],
+        );
         source
             .children
             .lock()
-            .insert("root".into(), vec![node("child", "Child", "docx")]);
+            .insert("root".into(), vec![leaf("child", "Child", "docx")]);
         source
             .content
             .lock()
             .insert("obj-child".into(), Ok(b"# Child\n".to_vec()));
+        source
+            .content
+            .lock()
+            .insert("obj-sibling".into(), Ok(b"# Sibling\n".to_vec()));
         source.content.lock().insert(
             "obj-root".into(),
             Ok(b"See [child](https://example.feishu.cn/wiki/child).\n".to_vec()),
         );
         filesystem.refresh_now().unwrap();
 
-        let (inode, _) = filesystem.lookup(ROOT_INODE, b"index.md").unwrap();
+        let (root_inode, kind) = filesystem.lookup(ROOT_INODE, b"Root").unwrap();
+        assert_eq!(kind, FileType::Directory);
+        assert_eq!(
+            filesystem.lookup(ROOT_INODE, b"Sibling.md").unwrap().1,
+            FileType::File
+        );
+        let (inode, _) = filesystem.lookup(root_inode, b"index.md").unwrap();
         let mut output = [0_u8; 128];
         let count = filesystem.read(inode, 0, &mut output).unwrap();
-        assert_eq!(&output[..count], b"See [child](<Child/index.md>).\n");
+        assert_eq!(&output[..count], b"See [child](<Child.md>).\n");
 
-        let (child_inode, _) = filesystem.lookup(ROOT_INODE, b"Child").unwrap();
-        let (child_index, _) = filesystem.lookup(child_inode, b"index.md").unwrap();
-        let count = filesystem.read(child_index, 0, &mut output).unwrap();
+        let (child_inode, kind) = filesystem.lookup(root_inode, b"Child.md").unwrap();
+        assert_eq!(kind, FileType::File);
+        let count = filesystem.read(child_inode, 0, &mut output).unwrap();
         assert_eq!(&output[..count], b"# Child\n");
     }
 
@@ -620,7 +647,11 @@ mod tests {
         source
             .children
             .lock()
-            .insert("root".into(), vec![node("child", "Child", "docx")]);
+            .insert("space-1".into(), vec![node("root", "Root", "docx")]);
+        source
+            .children
+            .lock()
+            .insert("root".into(), vec![leaf("child", "Child", "docx")]);
         source
             .content
             .lock()
@@ -631,48 +662,50 @@ mod tests {
         );
         filesystem.refresh_now().unwrap();
 
-        let (inode, _) = filesystem.lookup(ROOT_INODE, b"index.md").unwrap();
+        let (root_inode, _) = filesystem.lookup(ROOT_INODE, b"Root").unwrap();
+        let (inode, _) = filesystem.lookup(root_inode, b"index.md").unwrap();
         let mut output = [0_u8; 128];
         let count = filesystem.read(inode, 0, &mut output).unwrap();
-        assert_eq!(&output[..count], b"See [child](<Child/index.md>).\n");
+        assert_eq!(&output[..count], b"See [child](<Child.md>).\n");
 
         source
             .children
             .lock()
-            .insert("root".into(), vec![node("child", "Renamed", "docx")]);
+            .insert("root".into(), vec![leaf("child", "Renamed", "docx")]);
         filesystem.refresh_now().unwrap();
 
-        let (inode, _) = filesystem.lookup(ROOT_INODE, b"index.md").unwrap();
+        let (root_inode, _) = filesystem.lookup(ROOT_INODE, b"Root").unwrap();
+        let (inode, _) = filesystem.lookup(root_inode, b"index.md").unwrap();
         let count = filesystem.read(inode, 0, &mut output).unwrap();
-        assert_eq!(&output[..count], b"See [child](<Renamed/index.md>).\n");
+        assert_eq!(&output[..count], b"See [child](<Renamed.md>).\n");
     }
 
     #[test]
     fn stale_cache_is_served_when_refresh_fails() {
         let (filesystem, source) = test_fs(Duration::from_millis(1));
-        let (inode, _) = filesystem.lookup(ROOT_INODE, b"index.md").unwrap();
-        assert_eq!(filesystem.metadata(inode).unwrap().size, 7);
+        let (inode, _) = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap();
+        assert_eq!(filesystem.metadata(inode).unwrap().size, 8);
         source
             .content
             .lock()
-            .insert("obj-root".into(), Err("offline".into()));
+            .insert("obj-one".into(), Err("offline".into()));
         thread::sleep(Duration::from_millis(3));
-        assert_eq!(filesystem.metadata(inode).unwrap().size, 7);
+        assert_eq!(filesystem.metadata(inode).unwrap().size, 8);
         let mut output = [0_u8; 16];
         let count = filesystem.read(inode, 0, &mut output).unwrap();
-        assert_eq!(&output[..count], b"# Root\n");
+        assert_eq!(&output[..count], b"# Guide\n");
     }
 
     #[test]
     fn reopening_refreshes_expired_content() {
         let (filesystem, source) = test_fs(Duration::from_millis(1));
-        let (inode, _) = filesystem.lookup(ROOT_INODE, b"index.md").unwrap();
+        let (inode, _) = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap();
         filesystem.open_file(inode, false).unwrap();
 
         source
             .content
             .lock()
-            .insert("obj-root".into(), Ok(b"# Updated\n".to_vec()));
+            .insert("obj-one".into(), Ok(b"# Updated\n".to_vec()));
         thread::sleep(Duration::from_millis(3));
         filesystem.open_file(inode, false).unwrap();
 
@@ -684,7 +717,7 @@ mod tests {
     #[test]
     fn unchanged_content_preserves_generation_and_mtime() {
         let (filesystem, _) = test_fs(Duration::from_millis(1));
-        let (inode, _) = filesystem.lookup(ROOT_INODE, b"index.md").unwrap();
+        let (inode, _) = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap();
         let initial = filesystem.metadata(inode).unwrap();
         thread::sleep(Duration::from_millis(3));
         let refreshed = filesystem.metadata(inode).unwrap();
@@ -699,17 +732,13 @@ mod tests {
         source
             .children
             .lock()
-            .insert("root".into(), vec![node("one", "Guide", "docx")]);
-        source
-            .content
-            .lock()
-            .insert("obj-one".into(), Ok(b"one".to_vec()));
+            .insert("space-1".into(), vec![leaf("one", "Guide", "docx")]);
         filesystem.refresh_now().unwrap();
-        let (first_inode, _) = filesystem.lookup(ROOT_INODE, b"Guide").unwrap();
+        let (first_inode, _) = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap();
 
         source.children.lock().insert(
-            "root".into(),
-            vec![node("one", "Guide", "docx"), node("two", "guide", "docx")],
+            "space-1".into(),
+            vec![leaf("one", "Guide", "docx"), leaf("two", "guide", "docx")],
         );
         source
             .content
@@ -717,14 +746,14 @@ mod tests {
             .insert("obj-two".into(), Ok(b"two".to_vec()));
         filesystem.refresh_now().unwrap();
         assert_eq!(
-            filesystem.lookup(ROOT_INODE, b"Guide").unwrap().0,
+            filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap().0,
             first_inode
         );
         assert!(
             filesystem
                 .tree_lines()
                 .iter()
-                .any(|line| line.starts_with("guide~"))
+                .any(|line| line.starts_with("guide~") && line.ends_with(".md"))
         );
     }
 

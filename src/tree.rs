@@ -54,6 +54,8 @@ pub(crate) struct FsState {
     revision: u64,
     created_ns: u64,
     pub root_title: String,
+    /// Number of remote documents in the current snapshot.
+    pub document_count: usize,
 }
 
 impl FsState {
@@ -68,6 +70,7 @@ impl FsState {
             revision: 0,
             created_ns,
             root_title: String::new(),
+            document_count: 0,
         };
         state.replace(tree)?;
         Ok(state)
@@ -75,9 +78,8 @@ impl FsState {
 
     pub fn replace(&mut self, tree: &RemoteTree) -> Result<Vec<String>> {
         self.revision = self.revision.saturating_add(1);
-        self.root_title.clone_from(&tree.root.title);
-        self.inode_by_key
-            .insert(directory_key(&tree.root.node_token), ROOT_INODE);
+        self.root_title.clone_from(&tree.title);
+        self.document_count = tree.node_count();
 
         let old_paths = self
             .nodes
@@ -89,82 +91,85 @@ impl FsState {
             nodes: HashMap::with_capacity(tree.node_count().saturating_mul(2)),
             content_path_by_token: HashMap::with_capacity(tree.node_count().saturating_mul(2)),
         };
-        self.add_directory(
-            tree,
-            &tree.root,
+        // The mount root is the knowledge space itself: a directory without content.
+        let root_entries =
+            self.place_children(tree, &tree.space_id, ROOT_INODE, "", None, &mut building)?;
+        building.nodes.insert(
             ROOT_INODE,
-            ROOT_INODE,
-            String::new(),
-            &mut building,
-        )?;
+            VirtualNode {
+                inode: ROOT_INODE,
+                parent: ROOT_INODE,
+                path: String::new(),
+                generation: self.revision,
+                created_ns: self.created_ns,
+                kind: VirtualNodeKind::Directory {
+                    entries: root_entries,
+                },
+            },
+        );
         self.nodes = building.nodes;
         self.content_path_by_token = building.content_path_by_token;
         Ok(old_paths)
     }
 
-    fn add_directory(
+    /// Create the entries for every child of `parent_token` inside `parent_path`.
+    ///
+    /// `reserved` holds names already taken in that directory (the parent's own
+    /// content file), so children never shadow it.
+    fn place_children(
+        &mut self,
+        tree: &RemoteTree,
+        parent_token: &str,
+        parent_inode: u64,
+        parent_path: &str,
+        reserved: Option<&str>,
+        building: &mut Building,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let children = tree.children_of(parent_token);
+        let mut names = self.assign_child_names(tree, parent_token, children, reserved);
+        let mut entries = Vec::with_capacity(children.len());
+        for (child, name) in children.iter().zip(names.drain(..)) {
+            let path = join_path(parent_path, &name);
+            let entry = if tree.has_children(&child.node_token) {
+                self.place_directory(tree, child, parent_inode, path, name, building)?
+            } else {
+                self.place_content_file(child, parent_inode, parent_path, &name, building)?
+            };
+            entries.push(entry);
+        }
+
+        entries.sort_by(|left, right| {
+            fold_name_bytes(&left.name)
+                .cmp(&fold_name_bytes(&right.name))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(entries)
+    }
+
+    /// A node with child pages becomes a directory holding `index.*` plus them.
+    fn place_directory(
         &mut self,
         tree: &RemoteTree,
         remote: &RemoteNode,
-        inode: u64,
-        parent: u64,
+        parent_inode: u64,
         path: String,
+        name: String,
         building: &mut Building,
-    ) -> Result<()> {
-        let content_path_by_token = &mut building.content_path_by_token;
-        let (content_name, content_request) = content_mapping(remote);
-        let content_inode = self.inode_for(&content_key(&remote.node_token))?;
-        let content_path = join_path(&path, &content_name);
-        register_link_target(content_path_by_token, &remote.node_token, &content_path);
-        if let Some(object_token) = remote.object_token.as_deref() {
-            register_link_target(content_path_by_token, object_token, &content_path);
+    ) -> Result<DirectoryEntry> {
+        let inode = self.inode_for(&directory_key(&remote.node_token))?;
+        let content_name = content_spec(remote).map(|spec| index_file_name(&spec));
+        let mut entries = Vec::new();
+        if let Some(content_name) = content_name.as_deref() {
+            entries.push(self.place_content_file(remote, inode, &path, content_name, building)?);
         }
-        if let Some(link_token) = remote
-            .url
-            .as_deref()
-            .and_then(|url| url.parse::<KnowledgeLink>().ok())
-            .map(|link| link.token)
-        {
-            register_link_target(content_path_by_token, &link_token, &content_path);
-        }
-        building.nodes.insert(
-            content_inode,
-            VirtualNode {
-                inode: content_inode,
-                parent: inode,
-                path: content_path.clone(),
-                generation: self.revision,
-                created_ns: self.created_ns,
-                kind: VirtualNodeKind::File {
-                    request: content_request,
-                },
-            },
-        );
-
-        let children = tree
-            .children
-            .get(&remote.node_token)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let assigned_names = self.assign_child_names(remote, children, &content_name);
-        let mut entries = Vec::with_capacity(children.len() + 1);
-        entries.push(DirectoryEntry {
-            name: content_name.as_bytes().to_vec(),
-            inode: content_inode,
-            kind: FileType::File,
-        });
-
-        for (child, child_name) in children.iter().zip(assigned_names) {
-            let child_inode = self.inode_for(&directory_key(&child.node_token))?;
-            let child_path = join_path(&path, &child_name);
-            entries.push(DirectoryEntry {
-                name: child_name.as_bytes().to_vec(),
-                inode: child_inode,
-                kind: FileType::Directory,
-            });
-            self.add_directory(tree, child, child_inode, inode, child_path, building)?;
-        }
-
+        entries.extend(self.place_children(
+            tree,
+            &remote.node_token,
+            inode,
+            &path,
+            content_name.as_deref(),
+            building,
+        )?);
         entries.sort_by(|left, right| {
             fold_name_bytes(&left.name)
                 .cmp(&fold_name_bytes(&right.name))
@@ -174,27 +179,92 @@ impl FsState {
             inode,
             VirtualNode {
                 inode,
-                parent,
+                parent: parent_inode,
                 path,
                 generation: self.revision,
                 created_ns: self.created_ns,
                 kind: VirtualNodeKind::Directory { entries },
             },
         );
-        Ok(())
+        Ok(DirectoryEntry {
+            name: name.as_bytes().to_vec(),
+            inode,
+            kind: FileType::Directory,
+        })
+    }
+
+    /// Materialise a node's own content as a file at `path` and index its tokens.
+    fn place_content_file(
+        &mut self,
+        remote: &RemoteNode,
+        parent_inode: u64,
+        directory: &str,
+        file_name: &str,
+        building: &mut Building,
+    ) -> Result<DirectoryEntry> {
+        let spec = content_spec(remote);
+        let request = spec
+            .map(|spec| spec.request)
+            .unwrap_or_else(|| unsupported_request(remote, "节点没有可读取的 obj_token"));
+        let inode = self.inode_for(&content_key(&remote.node_token))?;
+        let path = join_path(directory, file_name);
+        self.register_link_targets(building, remote, &path);
+        building.nodes.insert(
+            inode,
+            VirtualNode {
+                inode,
+                parent: parent_inode,
+                path,
+                generation: self.revision,
+                created_ns: self.created_ns,
+                kind: VirtualNodeKind::File { request },
+            },
+        );
+        Ok(DirectoryEntry {
+            name: file_name.as_bytes().to_vec(),
+            inode,
+            kind: FileType::File,
+        })
+    }
+
+    fn register_link_targets(&self, building: &mut Building, remote: &RemoteNode, path: &str) {
+        let targets = &mut building.content_path_by_token;
+        register_link_target(targets, &remote.node_token, path);
+        if let Some(object_token) = remote.object_token.as_deref() {
+            register_link_target(targets, object_token, path);
+        }
+        if let Some(link_token) = remote
+            .url
+            .as_deref()
+            .and_then(|url| url.parse::<KnowledgeLink>().ok())
+            .map(|link| link.token)
+        {
+            register_link_target(targets, &link_token, path);
+        }
     }
 
     fn assign_child_names(
         &mut self,
-        parent: &RemoteNode,
+        tree: &RemoteTree,
+        parent_token: &str,
         children: &[RemoteNode],
-        content_name: &str,
+        reserved: Option<&str>,
     ) -> Vec<String> {
-        let mut used = HashSet::from([fold_name(content_name)]);
+        let mut used: HashSet<String> = reserved.into_iter().map(fold_name).collect();
         let mut names = Vec::with_capacity(children.len());
         for child in children {
-            let edge = (parent.node_token.clone(), child.node_token.clone());
-            let base = sanitize_component(&child.title);
+            let edge = (parent_token.to_owned(), child.node_token.clone());
+            let has_children = tree.has_children(&child.node_token);
+            let base = if has_children {
+                sanitize_component(&child.title)
+            } else {
+                leaf_file_name(child)
+            };
+            let extension = if has_children {
+                None
+            } else {
+                content_spec(child).map(|spec| spec.extension)
+            };
             let title_is_unchanged = self
                 .base_name_by_edge
                 .get(&edge)
@@ -207,7 +277,7 @@ impl FsState {
                 continue;
             }
 
-            let name = unique_component(&base, &child.node_token, &mut used);
+            let name = unique_component(&base, &child.node_token, &mut used, extension.as_deref());
             self.base_name_by_edge.insert(edge.clone(), base);
             self.name_by_edge.insert(edge, name.clone());
             names.push(name);
@@ -301,59 +371,97 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+/// Extension and fetch request for a node's own content file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentSpec {
+    /// Extension without the dot.
+    pub extension: String,
+    pub request: ContentRequest,
+}
+
+/// Content of a node, or `None` for nodes that have no document at all
+/// (currently only the knowledge-space root).
 #[must_use]
-pub fn content_mapping(node: &RemoteNode) -> (String, ContentRequest) {
+pub fn content_spec(node: &RemoteNode) -> Option<ContentSpec> {
+    if node.object_type.as_deref() == Some(crate::remote::SPACE_OBJECT_TYPE) {
+        return None;
+    }
     let Some(token) = node.object_token.as_ref().filter(|token| !token.is_empty()) else {
-        return unsupported_content(node, "节点没有可读取的 obj_token");
+        return Some(unsupported_spec(node, "节点没有可读取的 obj_token"));
     };
-    match node.object_type.as_deref().map(str::to_ascii_lowercase) {
-        Some(kind) if kind == "docx" => (
-            "index.md".into(),
-            ContentRequest::Markdown {
+    let kind = node.object_type.as_deref().map(str::to_ascii_lowercase);
+    match kind.as_deref() {
+        Some("docx") => Some(ContentSpec {
+            extension: "md".into(),
+            request: ContentRequest::Markdown {
                 token: token.clone(),
-                document_type: kind,
+                document_type: "docx".into(),
             },
-        ),
-        Some(kind) if kind == "doc" => (
-            "index.docx".into(),
-            ContentRequest::Export {
+        }),
+        Some("doc") => Some(ContentSpec {
+            extension: "docx".into(),
+            request: ContentRequest::Export {
                 token: token.clone(),
-                document_type: kind,
+                document_type: "doc".into(),
                 extension: "docx".into(),
             },
-        ),
-        Some(kind) if kind == "sheet" || kind == "bitable" => (
-            "index.xlsx".into(),
-            ContentRequest::Export {
+        }),
+        Some(kind @ ("sheet" | "bitable")) => Some(ContentSpec {
+            extension: "xlsx".into(),
+            request: ContentRequest::Export {
                 token: token.clone(),
-                document_type: kind,
+                document_type: kind.to_owned(),
                 extension: "xlsx".into(),
             },
-        ),
-        Some(kind) if kind == "file" => (
-            format!("index.{}", safe_extension(&node.title)),
-            ContentRequest::Download {
+        }),
+        Some("file") => Some(ContentSpec {
+            extension: safe_extension(&node.title),
+            request: ContentRequest::Download {
                 token: token.clone(),
             },
-        ),
-        Some(kind) => unsupported_content(node, &format!("暂不支持对象类型 {kind}")),
-        None => unsupported_content(node, "节点没有 obj_type"),
+        }),
+        Some(kind) => Some(unsupported_spec(node, &format!("暂不支持对象类型 {kind}"))),
+        None => Some(unsupported_spec(node, "节点没有 obj_type")),
     }
 }
 
-fn unsupported_content(node: &RemoteNode, reason: &str) -> (String, ContentRequest) {
+/// File name for the content of a node that owns child pages.
+fn index_file_name(spec: &ContentSpec) -> String {
+    format!("index.{}", spec.extension)
+}
+
+/// File name for a node without child pages: the title itself carries the name.
+fn leaf_file_name(node: &RemoteNode) -> String {
+    let Some(spec) = content_spec(node) else {
+        return sanitize_component(&node.title);
+    };
+    let title = node.title.trim();
+    let suffix = format!(".{}", spec.extension.to_ascii_lowercase());
+    let named = if title.to_ascii_lowercase().ends_with(&suffix) {
+        title.to_owned()
+    } else {
+        format!("{title}.{}", spec.extension)
+    };
+    sanitize_component(&named)
+}
+
+fn unsupported_spec(node: &RemoteNode, reason: &str) -> ContentSpec {
+    ContentSpec {
+        extension: "md".into(),
+        request: unsupported_request(node, reason),
+    }
+}
+
+fn unsupported_request(node: &RemoteNode, reason: &str) -> ContentRequest {
     let object_type = node.object_type.as_deref().unwrap_or("unknown");
     let url = node.url.as_deref().unwrap_or("（飞书未返回链接）");
     let markdown = format!(
         "# {}\n\n> FeishuFS 未能导出此节点。\n\n- 原因：{}\n- 对象类型：`{}`\n- 云端链接：{}\n",
         node.title, reason, object_type, url
     );
-    (
-        "index.md".into(),
-        ContentRequest::Inline {
-            bytes: markdown.into_bytes(),
-        },
-    )
+    ContentRequest::Inline {
+        bytes: markdown.into_bytes(),
+    }
 }
 
 fn safe_extension(title: &str) -> String {
@@ -405,10 +513,33 @@ pub fn sanitize_component(title: &str) -> String {
     }
 }
 
-fn unique_component(base: &str, token: &str, used: &mut HashSet<String>) -> String {
+/// Disambiguate a name already taken in the same directory.
+///
+/// When `extension` is given the suffix is inserted before it, so a renamed
+/// collision keeps a usable file extension (`guide~two.md`, not `guide.md~two`).
+fn unique_component(
+    base: &str,
+    token: &str,
+    used: &mut HashSet<String>,
+    extension: Option<&str>,
+) -> String {
     if used.insert(fold_name(base)) {
         return base.to_owned();
     }
+
+    let (stem, extension) = match extension {
+        Some(extension)
+            if base.len() > extension.len() + 1
+                && base.as_bytes()[base.len() - extension.len() - 1] == b'.'
+                && base[base.len() - extension.len()..].eq_ignore_ascii_case(extension) =>
+        {
+            (
+                &base[..base.len() - extension.len() - 1],
+                &base[base.len() - extension.len() - 1..],
+            )
+        }
+        _ => (base, ""),
+    };
 
     let short_token: String = token
         .chars()
@@ -426,10 +557,10 @@ fn unique_component(base: &str, token: &str, used: &mut HashSet<String>) -> Stri
         } else {
             format!("~{short_token}-{index}")
         };
-        let max_base = MAX_COMPONENT_BYTES.saturating_sub(suffix.len());
-        let mut candidate_base = base.to_owned();
-        truncate_utf8(&mut candidate_base, max_base);
-        let candidate = format!("{candidate_base}{suffix}");
+        let max_stem = MAX_COMPONENT_BYTES.saturating_sub(suffix.len() + extension.len());
+        let mut candidate_stem = stem.to_owned();
+        truncate_utf8(&mut candidate_stem, max_stem);
+        let candidate = format!("{candidate_stem}{suffix}{extension}");
         if used.insert(fold_name(&candidate)) {
             return candidate;
         }
@@ -487,9 +618,30 @@ pub(crate) fn directory_entries(node: &VirtualNode) -> Result<&[DirectoryEntry]>
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::remote::test_support::node;
+    use crate::remote::test_support::{leaf, node};
 
     use super::*;
+
+    /// Build a space whose top-level nodes are `root_nodes`.
+    fn wiki_tree(
+        root_nodes: Vec<RemoteNode>,
+        children: HashMap<String, Vec<RemoteNode>>,
+    ) -> RemoteTree {
+        RemoteTree {
+            space_id: "space-1".into(),
+            title: "Team Wiki".into(),
+            root_nodes,
+            children,
+        }
+    }
+
+    fn names_of(state: &FsState, inode: u64) -> Vec<String> {
+        directory_entries(&state.nodes[&inode])
+            .unwrap()
+            .iter()
+            .map(|entry| String::from_utf8(entry.name.clone()).unwrap())
+            .collect()
+    }
 
     #[test]
     fn sanitizes_cross_platform_names() {
@@ -511,83 +663,128 @@ mod tests {
     #[test]
     fn maps_supported_content_types() {
         let doc = node("doc", "Doc", "docx");
-        assert!(matches!(
-            content_mapping(&doc),
-            (name, ContentRequest::Markdown { .. }) if name == "index.md"
-        ));
+        assert_eq!(
+            content_spec(&doc),
+            Some(ContentSpec {
+                extension: "md".into(),
+                request: ContentRequest::Markdown {
+                    token: "obj-doc".into(),
+                    document_type: "docx".into(),
+                },
+            })
+        );
+        assert_eq!(index_file_name(&content_spec(&doc).unwrap()), "index.md");
+        assert_eq!(leaf_file_name(&doc), "Doc.md");
+
         let file = node("file", "Manual.PDF", "file");
-        assert!(matches!(
-            content_mapping(&file),
-            (name, ContentRequest::Download { .. }) if name == "index.pdf"
-        ));
+        assert_eq!(leaf_file_name(&file), "Manual.PDF");
+        assert_eq!(index_file_name(&content_spec(&file).unwrap()), "index.pdf");
+
+        let sheet = node("sheet", "2024 报表", "sheet");
+        assert_eq!(leaf_file_name(&sheet), "2024 报表.xlsx");
+
+        let space = crate::remote::test_support::space_node();
+        assert_eq!(content_spec(&space), None);
     }
 
     #[test]
-    fn keeps_existing_name_when_a_case_insensitive_duplicate_appears() {
-        let root = node("root", "Root", "docx");
-        let first = node("first", "Guide", "docx");
-        let mut tree = RemoteTree {
-            root: root.clone(),
-            children: HashMap::from([
-                ("root".into(), vec![first.clone()]),
-                ("first".into(), vec![]),
-            ]),
-        };
-        let mut state = FsState::from_remote(&tree, 1).unwrap();
-        let original = directory_entries(&state.nodes[&ROOT_INODE])
-            .unwrap()
-            .iter()
-            .find(|entry| entry.kind == FileType::Directory)
-            .unwrap()
-            .name
-            .clone();
+    fn nodes_without_child_pages_become_sibling_files() {
+        let tree = wiki_tree(
+            vec![leaf("a", "Alpha", "docx"), leaf("b", "Beta", "file")],
+            HashMap::new(),
+        );
+        let state = FsState::from_remote(&tree, 1).unwrap();
 
-        let duplicate = node("second", "guide", "docx");
-        tree.children.insert("root".into(), vec![first, duplicate]);
-        tree.children.insert("second".into(), vec![]);
-        state.replace(&tree).unwrap();
-        let directory_names: Vec<_> = directory_entries(&state.nodes[&ROOT_INODE])
+        let entries = directory_entries(&state.nodes[&ROOT_INODE]).unwrap();
+        assert_eq!(names_of(&state, ROOT_INODE), ["Alpha.md", "Beta.bin"]);
+        assert!(entries.iter().all(|entry| entry.kind == FileType::File));
+    }
+
+    #[test]
+    fn nodes_with_child_pages_become_directories_with_index() {
+        let mut tree = wiki_tree(vec![node("a", "Alpha", "docx")], HashMap::new());
+        tree.children
+            .insert("a".into(), vec![leaf("child", "Child", "docx")]);
+        let state = FsState::from_remote(&tree, 1).unwrap();
+
+        let alpha = directory_entries(&state.nodes[&ROOT_INODE])
             .unwrap()
             .iter()
-            .filter(|entry| entry.kind == FileType::Directory)
-            .map(|entry| String::from_utf8(entry.name.clone()).unwrap())
-            .collect();
-        assert!(directory_names.contains(&String::from_utf8(original).unwrap()));
-        assert!(
-            directory_names
+            .find(|entry| entry.name == b"Alpha")
+            .expect("Alpha should be a directory");
+        assert_eq!(alpha.kind, FileType::Directory);
+
+        let entries = directory_entries(&state.nodes[&alpha.inode]).unwrap();
+        assert_eq!(
+            entries
                 .iter()
-                .any(|name| name.starts_with("guide~"))
+                .map(|entry| String::from_utf8(entry.name.clone()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Child.md".to_owned(), "index.md".to_owned()]
         );
     }
 
     #[test]
-    fn cloud_rename_updates_name_without_changing_inode() {
-        let root = node("root", "Root", "docx");
-        let child = node("child", "Old name", "docx");
-        let mut tree = RemoteTree {
-            root: root.clone(),
-            children: HashMap::from([
-                ("root".into(), vec![child.clone()]),
-                ("child".into(), vec![]),
-            ]),
-        };
+    fn turning_a_leaf_into_a_branch_keeps_the_content_inode() {
+        let mut tree = wiki_tree(vec![leaf("a", "Alpha", "docx")], HashMap::new());
         let mut state = FsState::from_remote(&tree, 1).unwrap();
-        let initial = directory_entries(&state.nodes[&ROOT_INODE])
+        let file_inode = directory_entries(&state.nodes[&ROOT_INODE]).unwrap()[0].inode;
+
+        tree.root_nodes = vec![node("a", "Alpha", "docx")];
+        tree.children
+            .insert("a".into(), vec![leaf("child", "Child", "docx")]);
+        state.replace(&tree).unwrap();
+
+        let directory = directory_entries(&state.nodes[&ROOT_INODE]).unwrap()[0].clone();
+        assert_eq!(directory.kind, FileType::Directory);
+        let index = directory_entries(&state.nodes[&directory.inode])
             .unwrap()
             .iter()
-            .find(|entry| entry.kind == FileType::Directory)
-            .unwrap()
+            .find(|entry| entry.name == b"index.md")
+            .expect("index.md should exist");
+        assert_eq!(index.inode, file_inode);
+    }
+
+    #[test]
+    fn keeps_existing_name_when_a_case_insensitive_duplicate_appears() {
+        let first = node("first", "Guide", "docx");
+        let mut tree = wiki_tree(
+            vec![first.clone()],
+            HashMap::from([("first".into(), vec![leaf("kid", "Kid", "docx")])]),
+        );
+        let mut state = FsState::from_remote(&tree, 1).unwrap();
+        let original = directory_entries(&state.nodes[&ROOT_INODE]).unwrap()[0]
+            .name
             .clone();
+        assert_eq!(original, b"Guide");
+
+        let duplicate = node("second", "guide", "docx");
+        tree.root_nodes = vec![first, duplicate];
+        tree.children
+            .insert("second".into(), vec![leaf("kid2", "Kid", "docx")]);
+        state.replace(&tree).unwrap();
+
+        let names = names_of(&state, ROOT_INODE);
+        assert!(names.contains(&"Guide".to_owned()));
+        assert!(names.iter().any(|name| name.starts_with("guide~")));
+    }
+
+    #[test]
+    fn cloud_rename_updates_name_without_changing_inode() {
+        let child = node("child", "Old name", "docx");
+        let mut tree = wiki_tree(
+            vec![child.clone()],
+            HashMap::from([("child".into(), vec![leaf("kid", "Kid", "docx")])]),
+        );
+        let mut state = FsState::from_remote(&tree, 1).unwrap();
+        let initial = directory_entries(&state.nodes[&ROOT_INODE]).unwrap()[0].clone();
+        assert_eq!(initial.name, b"Old name");
 
         let mut renamed = child;
         renamed.title = "New name".into();
-        tree.children.insert("root".into(), vec![renamed]);
+        tree.root_nodes = vec![renamed];
         state.replace(&tree).unwrap();
-        let refreshed = directory_entries(&state.nodes[&ROOT_INODE])
-            .unwrap()
-            .iter()
-            .find(|entry| entry.kind == FileType::Directory)
-            .unwrap();
+        let refreshed = directory_entries(&state.nodes[&ROOT_INODE]).unwrap()[0].clone();
 
         assert_eq!(refreshed.name, b"New name");
         assert_eq!(refreshed.inode, initial.inode);
@@ -595,33 +792,60 @@ mod tests {
 
     #[test]
     fn inodes_survive_refresh_and_are_never_reused() {
-        let root = node("root", "Root", "docx");
         let child = node("child", "Child", "docx");
-        let mut tree = RemoteTree {
-            root: root.clone(),
-            children: HashMap::from([
-                ("root".into(), vec![child.clone()]),
-                ("child".into(), vec![]),
-            ]),
-        };
+        let mut tree = wiki_tree(
+            vec![child.clone()],
+            HashMap::from([("child".into(), vec![leaf("kid", "Kid", "docx")])]),
+        );
         let mut state = FsState::from_remote(&tree, 1).unwrap();
-        let child_inode = directory_entries(&state.nodes[&ROOT_INODE])
-            .unwrap()
-            .iter()
-            .find(|entry| entry.kind == FileType::Directory)
-            .unwrap()
-            .inode;
+        let child_inode = directory_entries(&state.nodes[&ROOT_INODE]).unwrap()[0].inode;
 
-        tree.children.insert("root".into(), vec![]);
+        tree.root_nodes = vec![];
         state.replace(&tree).unwrap();
-        tree.children.insert("root".into(), vec![child]);
+        assert!(
+            directory_entries(&state.nodes[&ROOT_INODE])
+                .unwrap()
+                .is_empty()
+        );
+
+        tree.root_nodes = vec![child];
         state.replace(&tree).unwrap();
-        let refreshed_inode = directory_entries(&state.nodes[&ROOT_INODE])
+        let refreshed_inode = directory_entries(&state.nodes[&ROOT_INODE]).unwrap()[0].inode;
+        assert_eq!(child_inode, refreshed_inode);
+    }
+
+    #[test]
+    fn links_are_rewritten_to_leaf_and_index_paths() {
+        let branch = node("branch", "指南", "docx");
+        let tree = wiki_tree(
+            vec![branch, leaf("leaf", "API 说明", "docx")],
+            HashMap::from([("branch".into(), vec![leaf("kid", "子页", "docx")])]),
+        );
+        let state = FsState::from_remote(&tree, 1).unwrap();
+        let index = directory_entries(&state.nodes[&ROOT_INODE])
             .unwrap()
             .iter()
-            .find(|entry| entry.kind == FileType::Directory)
-            .unwrap()
-            .inode;
-        assert_eq!(child_inode, refreshed_inode);
+            .find(|entry| entry.name == "指南".as_bytes())
+            .and_then(|entry| {
+                directory_entries(&state.nodes[&entry.inode])
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry.name == b"index.md")
+            })
+            .map(|entry| entry.inode)
+            .expect("指南/index.md should exist");
+
+        let branch_request = file_request(&state.nodes[&index]).unwrap().clone();
+        let source = concat!(
+            "[说明](https://example.feishu.cn/wiki/leaf)\n",
+            "[子页](https://example.feishu.cn/wiki/kid)\n",
+        );
+        let rendered =
+            String::from_utf8(state.render_markdown(index, &branch_request, source.as_bytes()))
+                .unwrap();
+        assert_eq!(
+            rendered,
+            concat!("[说明](<../API 说明.md>)\n", "[子页](<子页.md>)\n",)
+        );
     }
 }

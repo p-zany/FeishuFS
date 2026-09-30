@@ -36,7 +36,7 @@ enum Command {
 
 #[derive(Clone, Debug, Args)]
 struct CommonArgs {
-    /// 飞书/Lark 知识库节点链接
+    /// 知识库空间内任意文档的链接（用于定位要挂载的整个知识库）
     wiki_url: String,
 
     /// 飞书自建应用 App ID
@@ -102,7 +102,7 @@ fn run(command: Command) -> Result<()> {
     match command {
         Command::Inspect(args) => {
             let filesystem = connect(&args)?;
-            println!("根节点：{}", filesystem.root_title());
+            println!("知识库：{}", filesystem.root_title());
             println!("节点数：{}", filesystem.node_count());
             println!("映射预览：");
             for line in filesystem.tree_lines() {
@@ -154,7 +154,7 @@ fn mount(args: MountArgs) -> Result<()> {
     let _refresher = filesystem.start_refresher(args.common.refresh_interval);
 
     println!("已挂载：{}", args.mountpoint.display());
-    println!("根节点：{}", filesystem.root_title());
+    println!("知识库：{}", filesystem.root_title());
     println!(
         "刷新周期：{}",
         humantime::format_duration(args.common.refresh_interval)

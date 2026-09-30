@@ -455,6 +455,7 @@ dependencies = [
  "openlark-docs",
  "parking_lot",
  "pretty_assertions",
+ "serde",
  "tempfile",
  "thiserror",
  "tokio",
