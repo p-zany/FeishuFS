@@ -117,6 +117,29 @@ cargo run -- mount 'https://example.feishu.cn/wiki/wikcnxxx' ./mnt
 
 Lark 链接会自动使用 `https://open.larksuite.com`，飞书链接使用 `https://open.feishu.cn`。只有在显式传入 `--allow-custom-api-base-url` 后才允许自定义 API 地址。
 
+## 日志
+
+终端保持简短（只说明发生了什么），**完整错误链写入日志文件**——飞书错误码与响应体只在那里，排障请看文件：
+
+```bash
+# 默认写入当前目录的 feishufs.log，启动时会打印绝对路径
+tail -f feishufs.log
+
+# 指定路径
+feishufs mount '链接' ./mnt --log-file /var/log/feishufs.log
+FEISHUFS_LOG_FILE=/var/log/feishufs.log feishufs mount '链接' ./mnt
+
+# 只要终端，不写文件
+feishufs mount '链接' ./mnt --no-log-file
+
+# 让终端也变详细（默认终端 info，文件 debug；-vv 两者都 trace）
+feishufs mount '链接' ./mnt -vv
+# 或用 RUST_LOG 接管两个出口的过滤规则
+RUST_LOG=feishufs=trace feishufs inspect '链接'
+```
+
+日志文件以追加方式写，启动时超过 8 MiB 会轮转为 `feishufs.log.1`（只保留一份）。若用 sudo 运行，日志文件属主为 root。日志文件打开失败不会中断运行，只会降级为仅终端输出。
+
 ## 刷新和故障行为
 
 - 启动时读取所选节点的完整可见子树，正文和附件按需获取。

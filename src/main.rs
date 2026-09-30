@@ -7,10 +7,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Args, Parser, Subcommand};
-use feishufs::{FeishuFs, FsOptions, KnowledgeLink, OpenLarkOptions, OpenLarkSource};
+use feishufs::{FeishuFs, FsOptions, KnowledgeLink, OpenLarkOptions, OpenLarkSource, logging};
 use fsk::{MountOptions, MountSession};
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,6 +20,14 @@ use tracing_subscriber::EnvFilter;
 struct Cli {
     #[arg(short, long, action = ArgAction::Count, global = true)]
     verbose: u8,
+
+    /// 详细日志文件（默认：当前目录的 feishufs.log）
+    #[arg(long, env = "FEISHUFS_LOG_FILE", global = true, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    /// 不写日志文件，只输出到终端
+    #[arg(long, global = true)]
+    no_log_file: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -87,8 +94,17 @@ struct MountArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
-    match run(cli.command) {
+    let log_file = if cli.no_log_file {
+        None
+    } else {
+        Some(
+            cli.log_file
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(logging::DEFAULT_LOG_FILE)),
+        )
+    };
+    let log_path = logging::init(cli.verbose, log_file.as_deref());
+    match run(cli.command, log_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             error!(error = %format!("{error:#}"), "命令失败");
@@ -98,7 +114,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(command: Command) -> Result<()> {
+fn run(command: Command, log_path: Option<PathBuf>) -> Result<()> {
     match command {
         Command::Inspect(args) => {
             let filesystem = connect(&args)?;
@@ -110,7 +126,7 @@ fn run(command: Command) -> Result<()> {
             }
             Ok(())
         }
-        Command::Mount(args) => mount(args),
+        Command::Mount(args) => mount(args, log_path),
     }
 }
 
@@ -146,7 +162,7 @@ fn connect(args: &CommonArgs) -> Result<FeishuFs> {
     )
 }
 
-fn mount(args: MountArgs) -> Result<()> {
+fn mount(args: MountArgs, log_path: Option<PathBuf>) -> Result<()> {
     validate_mountpoint(&args.mountpoint)?;
     let filesystem = connect(&args.common)?;
     let session = mount_session(filesystem.clone(), &args.mountpoint)
@@ -159,6 +175,10 @@ fn mount(args: MountArgs) -> Result<()> {
         "刷新周期：{}",
         humantime::format_duration(args.common.refresh_interval)
     );
+    match &log_path {
+        Some(path) => println!("日志：{}", path.display()),
+        None => println!("日志：仅终端（已关闭日志文件）"),
+    }
     println!("按 Ctrl-C 卸载并退出。");
     info!(mountpoint = %args.mountpoint.display(), "FeishuFS 挂载成功");
 
@@ -240,18 +260,4 @@ fn platform_mount_hint(mountpoint: &Path) -> String {
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
     humantime::parse_duration(value).map_err(|error| error.to_string())
-}
-
-fn init_tracing(verbose: u8) {
-    let fallback = match verbose {
-        0 => "feishufs=info",
-        1 => "feishufs=debug",
-        _ => "feishufs=trace",
-    };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
-        .init();
 }

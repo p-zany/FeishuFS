@@ -144,7 +144,12 @@ impl FeishuFs {
                             Ok(summary) => {
                                 info!(nodes = summary.node_count, "知识库目录快照刷新完成")
                             }
-                            Err(error) => warn!(%error, "知识库目录刷新失败，继续使用旧快照"),
+                            Err(error) => {
+                                crate::logging::failure(
+                                    "知识库目录刷新失败，继续使用旧快照",
+                                    &error,
+                                );
+                            }
                         },
                     }
                 }
@@ -257,10 +262,14 @@ impl FeishuFs {
             }
             Err(error) => {
                 if let Some(cached) = existing.filter(|cached| cached.request == request) {
-                    warn!(inode, %error, "内容刷新失败，继续提供最后一次成功缓存");
+                    crate::logging::node_failure(
+                        inode,
+                        "内容刷新失败，继续提供最后一次成功缓存",
+                        &error,
+                    );
                     Ok(cached)
                 } else {
-                    warn!(inode, %error, "内容首次获取失败");
+                    crate::logging::node_failure(inode, "内容首次获取失败", &error);
                     Err(FsError::IO)
                 }
             }

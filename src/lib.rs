@@ -1,5 +1,6 @@
 pub mod filesystem;
 pub mod link;
+pub mod logging;
 mod markdown;
 pub mod openlark;
 mod platform;
