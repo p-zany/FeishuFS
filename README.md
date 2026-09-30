@@ -139,10 +139,23 @@ FEISHUFS_FUSE_SUDO=1 devenv tasks run feishufs:smoke-linux
 
 普通测试不会要求 FUSE 设备；真实挂载测试被标记为 `ignored`，只通过上面的任务显式运行。
 
+Git 提交钩子由 devenv 安装，需要 devenv 提供的 `cc`、`cargo` 等工具。请在 devenv shell 中提交（已提供 `.envrc`，启用 direnv 后普通终端也会自动进入环境）：
+
+```bash
+# 推荐
+devenv shell -- git commit
+
+# 或启用 direnv 后直接提交
+direnv allow .
+git commit
+```
+
+若在环境外提交，钩子会报 `linker \`cc\` not found`；此时用上面的命令重试即可，代码本身的检查结果不受影响。
+
 ## 当前边界
 
 - 首个版本不支持本地修改同步、离线首次挂载、GUI、多知识库合并或 macOS。
-- Markdown 中的远端图片/附件链接暂不重写为本地路径。
+- 飞书文档内嵌图片由 Markdown 接口以远程 URL 返回，暂不缓存或改写为本地文件；指向子树内 `file` 节点的链接会改写为本地路径。
 - 大型知识库受飞书 Wiki API 速率限制影响，一次完整刷新可能超过一分钟。
 - Windows 的最终原生挂载行为需在启用了 ProjFS 的 Windows 主机上验证；CI 和 `cargo-xwin` 负责条件编译检查。
 
