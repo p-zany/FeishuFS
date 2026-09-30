@@ -1,0 +1,28 @@
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# Rust
+/target/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Local mounts and caches
+/mnt/
+/.cache/
+
+# Logs and editor files
+*.log
+.DS_Store
+.idea/
+.vscode/
