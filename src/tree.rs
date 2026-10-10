@@ -5,7 +5,7 @@ use fsk::{FileType, ROOT_INODE};
 
 use crate::{
     link::KnowledgeLink,
-    markdown::rewrite_document_links_with_assets,
+    markdown::{DocumentTarget, rewrite_document_links_with_assets},
     remote::{ContentRequest, RemoteNode, RemoteTree},
 };
 
@@ -62,7 +62,7 @@ pub(crate) struct FsState {
     inode_by_key: HashMap<String, u64>,
     name_by_edge: HashMap<(String, String), String>,
     base_name_by_edge: HashMap<(String, String), String>,
-    content_path_by_token: HashMap<String, String>,
+    content_path_by_token: HashMap<String, DocumentTarget>,
     assets: HashMap<u64, AssetManifest>,
     asset_inodes: HashSet<u64>,
     next_inode: u64,
@@ -116,10 +116,10 @@ impl FsState {
         // The mount root is the space itself: a directory without content.
         let root_entries = self.place_children(
             tree,
-            &tree.space_id,
+            None,
             ROOT_INODE,
             "",
-            Some(ASSETS_DIRECTORY),
+            &[ASSETS_DIRECTORY.to_owned()],
             &mut building,
         )?;
         building.nodes.insert(
@@ -149,41 +149,55 @@ impl FsState {
         Ok(Some(old_paths))
     }
 
-    /// Create the entries for every child of `parent_token` inside `parent_path`.
-    ///
-    /// `reserved` holds names already taken in that directory (the parent's own
-    /// content file), so children never shadow it.
+    /// Plan own content and child pages together: all unchanged allocations
+    /// win over newcomers, including newly added CSVs in a table branch.
     fn place_children(
         &mut self,
         tree: &RemoteTree,
-        parent_token: &str,
+        owner: Option<&RemoteNode>,
         parent_inode: u64,
         parent_path: &str,
-        reserved: Option<&str>,
+        reserved: &[String],
         building: &mut Building,
     ) -> Result<Vec<DirectoryEntry>> {
-        let children = tree.children_of(parent_token);
-        let mut names = self.assign_child_names(tree, parent_token, children, reserved);
-        let mut entries = Vec::with_capacity(children.len());
-        for (child, name) in children.iter().zip(names.drain(..)) {
-            let path = join_path(parent_path, &name);
-            let entry = if tree.has_children(&child.node_token) {
-                self.place_directory(tree, child, parent_inode, path, name, building)?
+        let parent_token = owner.map_or(tree.space_id.as_str(), |node| node.node_token.as_str());
+        let mut plans = owner
+            .map(|node| content_entries(tree, node, true))
+            .unwrap_or_default();
+        for child in tree.children_of(parent_token) {
+            if tree.has_children(&child.node_token) {
+                plans.push(PlannedEntry {
+                    remote: child,
+                    key: directory_key(&child.node_token),
+                    base: sanitize_component(&child.title),
+                    content: None,
+                });
             } else {
-                self.place_content_file(child, parent_inode, parent_path, &name, building)?
+                plans.extend(content_entries(tree, child, false));
+            }
+        }
+        let names = self.assign_names(parent_token, &plans, reserved);
+        let mut entries = Vec::with_capacity(plans.len());
+        for (plan, name) in plans.iter().zip(names) {
+            let entry = if plan.content.is_none() {
+                self.place_directory(
+                    tree,
+                    plan.remote,
+                    parent_inode,
+                    join_path(parent_path, &name),
+                    name,
+                    building,
+                )?
+            } else {
+                self.place_content_file(plan, parent_inode, parent_path, &name, building)?
             };
             entries.push(entry);
         }
-
-        entries.sort_by(|left, right| {
-            fold_name_bytes(&left.name)
-                .cmp(&fold_name_bytes(&right.name))
-                .then_with(|| left.name.cmp(&right.name))
-        });
+        sort_entries(&mut entries);
         Ok(entries)
     }
 
-    /// A node with child pages becomes a directory holding `index.*` plus them.
+    /// A branch contains its own content file(s) alongside child pages.
     fn place_directory(
         &mut self,
         tree: &RemoteTree,
@@ -194,24 +208,7 @@ impl FsState {
         building: &mut Building,
     ) -> Result<DirectoryEntry> {
         let inode = self.inode_for(&directory_key(&remote.node_token))?;
-        let content_name = content_spec(remote).map(|spec| index_file_name(&spec));
-        let mut entries = Vec::new();
-        if let Some(content_name) = content_name.as_deref() {
-            entries.push(self.place_content_file(remote, inode, &path, content_name, building)?);
-        }
-        entries.extend(self.place_children(
-            tree,
-            &remote.node_token,
-            inode,
-            &path,
-            content_name.as_deref(),
-            building,
-        )?);
-        entries.sort_by(|left, right| {
-            fold_name_bytes(&left.name)
-                .cmp(&fold_name_bytes(&right.name))
-                .then_with(|| left.name.cmp(&right.name))
-        });
+        let entries = self.place_children(tree, Some(remote), inode, &path, &[], building)?;
         building.nodes.insert(
             inode,
             VirtualNode {
@@ -224,28 +221,29 @@ impl FsState {
             },
         );
         Ok(DirectoryEntry {
-            name: name.as_bytes().to_vec(),
+            name: name.into_bytes(),
             inode,
             kind: FileType::Directory,
         })
     }
 
-    /// Materialise a node's own content as a file at `path` and index its tokens.
     fn place_content_file(
         &mut self,
-        remote: &RemoteNode,
+        plan: &PlannedEntry<'_>,
         parent_inode: u64,
         directory: &str,
         file_name: &str,
         building: &mut Building,
     ) -> Result<DirectoryEntry> {
-        let spec = content_spec(remote);
-        let request = spec
-            .map(|spec| spec.request)
-            .unwrap_or_else(|| unsupported_request(remote, "The node has no readable obj_token"));
-        let inode = self.inode_for(&content_key(&remote.node_token))?;
+        let request = plan
+            .content
+            .as_ref()
+            .expect("planned content file")
+            .request
+            .clone();
+        let inode = self.inode_for(&plan.key)?;
         let path = join_path(directory, file_name);
-        self.register_link_targets(building, remote, &path);
+        self.register_link_targets(building, plan.remote, &path, &request);
         building.nodes.insert(
             inode,
             VirtualNode {
@@ -264,11 +262,21 @@ impl FsState {
         })
     }
 
-    fn register_link_targets(&self, building: &mut Building, remote: &RemoteNode, path: &str) {
+    fn register_link_targets(
+        &self,
+        building: &mut Building,
+        remote: &RemoteNode,
+        path: &str,
+        request: &ContentRequest,
+    ) {
+        let sub_id = match request {
+            ContentRequest::TableCsv { sub_id, .. } => Some(sub_id.as_str()),
+            _ => None,
+        };
         let targets = &mut building.content_path_by_token;
-        register_link_target(targets, &remote.node_token, path);
+        register_link_target(targets, &remote.node_token, path, sub_id);
         if let Some(object_token) = remote.object_token.as_deref() {
-            register_link_target(targets, object_token, path);
+            register_link_target(targets, object_token, path, sub_id);
         }
         if let Some(link_token) = remote
             .url
@@ -276,50 +284,53 @@ impl FsState {
             .and_then(|url| url.parse::<KnowledgeLink>().ok())
             .map(|link| link.token)
         {
-            register_link_target(targets, &link_token, path);
+            register_link_target(targets, &link_token, path, sub_id);
         }
     }
 
-    fn assign_child_names(
+    fn assign_names(
         &mut self,
-        tree: &RemoteTree,
         parent_token: &str,
-        children: &[RemoteNode],
-        reserved: Option<&str>,
+        plans: &[PlannedEntry<'_>],
+        reserved: &[String],
     ) -> Vec<String> {
-        let mut used: HashSet<String> = reserved.into_iter().map(fold_name).collect();
-        let mut names = Vec::with_capacity(children.len());
-        for child in children {
-            let edge = (parent_token.to_owned(), child.node_token.clone());
-            let has_children = tree.has_children(&child.node_token);
-            let base = if has_children {
-                sanitize_component(&child.title)
-            } else {
-                leaf_file_name(child)
-            };
-            let extension = if has_children {
-                None
-            } else {
-                content_spec(child).map(|spec| spec.extension)
-            };
-            let title_is_unchanged = self
-                .base_name_by_edge
-                .get(&edge)
-                .is_some_and(|existing| existing == &base);
-            if title_is_unchanged
+        let mut used: HashSet<String> = reserved.iter().map(|name| fold_name(name)).collect();
+        let mut names = vec![None; plans.len()];
+        // Reserve every unchanged allocation before assigning any new names,
+        // even when a new subtable sorts before the existing one.
+        for (index, plan) in plans.iter().enumerate() {
+            let edge = (parent_token.to_owned(), plan.key.clone());
+            if self.base_name_by_edge.get(&edge) == Some(&plan.base)
                 && let Some(existing) = self.name_by_edge.get(&edge)
                 && used.insert(fold_name(existing))
             {
-                names.push(existing.clone());
+                names[index] = Some(existing.clone());
+            }
+        }
+        for (index, plan) in plans.iter().enumerate() {
+            if names[index].is_some() {
                 continue;
             }
-
-            let name = unique_component(&base, &child.node_token, &mut used, extension.as_deref());
-            self.base_name_by_edge.insert(edge.clone(), base);
+            let token = match plan.content.as_ref().map(|spec| &spec.request) {
+                Some(ContentRequest::TableCsv { sub_id, .. }) => sub_id,
+                _ => &plan.remote.node_token,
+            };
+            let name = unique_component(
+                &plan.base,
+                token,
+                &mut used,
+                plan.content.as_ref().map(|spec| spec.extension.as_str()),
+            );
+            let edge = (parent_token.to_owned(), plan.key.clone());
+            self.base_name_by_edge
+                .insert(edge.clone(), plan.base.clone());
             self.name_by_edge.insert(edge, name.clone());
-            names.push(name);
+            names[index] = Some(name);
         }
         names
+            .into_iter()
+            .map(|name| name.expect("assigned name"))
+            .collect()
     }
 
     /// Install the assets of a successfully fetched document. Failure/recovery
@@ -575,14 +586,111 @@ impl FsState {
 
 struct Building {
     nodes: HashMap<u64, VirtualNode>,
-    content_path_by_token: HashMap<String, String>,
+    content_path_by_token: HashMap<String, DocumentTarget>,
 }
 
-fn register_link_target(targets: &mut HashMap<String, String>, token: &str, path: &str) {
-    if !token.is_empty() {
-        targets
-            .entry(token.to_owned())
-            .or_insert_with(|| path.to_owned());
+struct PlannedEntry<'a> {
+    remote: &'a RemoteNode,
+    key: String,
+    base: String,
+    content: Option<ContentSpec>,
+}
+
+fn content_entries<'a>(
+    tree: &RemoteTree,
+    node: &'a RemoteNode,
+    branch: bool,
+) -> Vec<PlannedEntry<'a>> {
+    if node.is_table()
+        && let Some(token) = node.object_token.as_ref().filter(|token| !token.is_empty())
+    {
+        let tables = tree.subtables.get(&node.node_token);
+        if let Some(tables) = tables.filter(|tables| !tables.is_empty()) {
+            return tables
+                .iter()
+                .map(|table| PlannedEntry {
+                    remote: node,
+                    key: format!(
+                        "csv:{}:{}:{}",
+                        node.node_token.len(),
+                        node.node_token,
+                        table.id
+                    ),
+                    base: csv_file_name(&node.title, &table.name),
+                    content: Some(ContentSpec {
+                        extension: "csv".into(),
+                        request: ContentRequest::TableCsv {
+                            token: token.clone(),
+                            document_type: node
+                                .object_type
+                                .as_deref()
+                                .expect("table type")
+                                .to_ascii_lowercase(),
+                            sub_id: table.id.clone(),
+                        },
+                    }),
+                })
+                .collect();
+        }
+        let spec = unsupported_spec(
+            node,
+            if tables.is_some() {
+                "The table has no visible subtables"
+            } else {
+                "The subtable list is unavailable"
+            },
+        );
+        return vec![PlannedEntry {
+            remote: node,
+            key: content_key(&node.node_token),
+            base: if branch {
+                index_file_name(&spec)
+            } else {
+                file_name(&node.title, &spec.extension)
+            },
+            content: Some(spec),
+        }];
+    }
+    content_spec(node)
+        .into_iter()
+        .map(|spec| PlannedEntry {
+            remote: node,
+            key: content_key(&node.node_token),
+            base: if branch {
+                index_file_name(&spec)
+            } else {
+                leaf_file_name(node)
+            },
+            content: Some(spec),
+        })
+        .collect()
+}
+
+fn sort_entries(entries: &mut [DirectoryEntry]) {
+    entries.sort_by(|left, right| {
+        fold_name_bytes(&left.name)
+            .cmp(&fold_name_bytes(&right.name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+fn register_link_target(
+    targets: &mut HashMap<String, DocumentTarget>,
+    token: &str,
+    path: &str,
+    sub_id: Option<&str>,
+) {
+    if token.is_empty() {
+        return;
+    }
+    let target = targets
+        .entry(token.to_owned())
+        .or_insert_with(|| DocumentTarget {
+            path: path.to_owned(),
+            subtables: HashMap::new(),
+        });
+    if let Some(sub_id) = sub_id {
+        target.subtables.insert(sub_id.to_owned(), path.to_owned());
     }
 }
 
@@ -610,8 +718,8 @@ pub struct ContentSpec {
     pub request: ContentRequest,
 }
 
-/// Content of a node, or `None` for nodes that have no document at all
-/// (currently only the space root).
+/// Single-file content, or `None` for the space root and tables whose
+/// multiple CSV files are planned from the subtable manifest.
 #[must_use]
 pub fn content_spec(node: &RemoteNode) -> Option<ContentSpec> {
     if node.object_type.as_deref() == Some(crate::remote::SPACE_OBJECT_TYPE) {
@@ -638,14 +746,7 @@ pub fn content_spec(node: &RemoteNode) -> Option<ContentSpec> {
                 extension: "docx".into(),
             },
         }),
-        Some(kind @ ("sheet" | "bitable")) => Some(ContentSpec {
-            extension: "xlsx".into(),
-            request: ContentRequest::Export {
-                token: token.clone(),
-                document_type: kind.to_owned(),
-                extension: "xlsx".into(),
-            },
-        }),
+        Some("sheet" | "bitable") => None,
         Some("file") => Some(ContentSpec {
             extension: safe_extension(&node.title),
             request: ContentRequest::Download {
@@ -670,12 +771,29 @@ fn leaf_file_name(node: &RemoteNode) -> String {
     let Some(spec) = content_spec(node) else {
         return sanitize_component(&node.title);
     };
-    let title = node.title.trim();
-    let suffix = format!(".{}", spec.extension.to_ascii_lowercase());
+    file_name(&node.title, &spec.extension)
+}
+
+fn csv_file_name(title: &str, subtable: &str) -> String {
+    let mut title = sanitize_component(title);
+    let mut subtable = sanitize_component(subtable);
+    let budget = MAX_COMPONENT_BYTES - ".csv".len() - 1;
+    if title.len() + subtable.len() > budget {
+        truncate_utf8(&mut title, budget / 2);
+        truncate_utf8(&mut subtable, budget - title.len());
+        title = sanitize_component(&title);
+        subtable = sanitize_component(&subtable);
+    }
+    format!("{title}.{subtable}.csv")
+}
+
+fn file_name(title: &str, extension: &str) -> String {
+    let title = title.trim();
+    let suffix = format!(".{}", extension.to_ascii_lowercase());
     let named = if title.to_ascii_lowercase().ends_with(&suffix) {
         title.to_owned()
     } else {
-        format!("{title}.{}", spec.extension)
+        format!("{title}.{extension}")
     };
     sanitize_component(&named)
 }
@@ -867,6 +985,7 @@ mod tests {
             title: "Team Wiki".into(),
             root_nodes,
             children,
+            subtables: HashMap::new(),
         }
     }
 
@@ -917,7 +1036,8 @@ mod tests {
         assert_eq!(index_file_name(&content_spec(&file).unwrap()), "index.pdf");
 
         let sheet = node("sheet", "2024 报表", "sheet");
-        assert_eq!(leaf_file_name(&sheet), "2024 报表.xlsx");
+        assert_eq!(content_spec(&sheet), None);
+        assert_eq!(csv_file_name(&sheet.title, "收入"), "2024 报表.收入.csv");
 
         let space = crate::remote::test_support::space_node();
         assert_eq!(content_spec(&space), None);

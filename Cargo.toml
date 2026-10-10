@@ -16,7 +16,7 @@ humantime = "2.4.0"
 html-escape = "0.2.13"
 openlark-auth = "=0.20.0"
 openlark-core = "=0.20.0"
-openlark-docs = { version = "=0.20.0", features = ["ccm-wiki", "ccm-doc", "ccm-drive"] }
+openlark-docs = { version = "=0.20.0", features = ["ccm-wiki", "ccm-doc", "ccm-drive", "ccm-sheets", "bitable"] }
 parking_lot = "0.12.5"
 roxmltree = "0.20.0"
 serde = { version = "1.0.229", features = ["derive"] }

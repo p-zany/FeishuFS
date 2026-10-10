@@ -5,7 +5,7 @@ use std::{fs, sync::Arc, time::Duration};
 use anyhow::{Result, bail};
 use feishufs::{
     ContentAsset, ContentBundle, ContentRequest, FeishuFs, FsOptions, KnowledgeLink, RemoteNode,
-    RemoteSource, RemoteSpace,
+    RemoteSource, RemoteSpace, RemoteSubtable,
 };
 use fsk::{Filesystem, MountOptions, MountSession};
 
@@ -26,11 +26,29 @@ impl RemoteSource for SmokeSource {
         }
         Ok(match parent.node_token.as_str() {
             // A document with child pages becomes a directory with index.md.
-            "space-smoke" => vec![node("root", "Root")],
+            "space-smoke" => vec![
+                node("root", "Root"),
+                table_node("sheet", "报表", "sheet", false),
+                table_node("base", "数据", "bitable", true),
+            ],
             "root" => vec![node("child", "Child")],
             "child" => vec![leaf("leaf", "Leaf")],
+            "base" => vec![leaf("note", "说明")],
             _ => Vec::new(),
         })
+    }
+
+    fn list_subtables(&self, _node: &RemoteNode) -> Result<Vec<RemoteSubtable>> {
+        Ok(vec![
+            RemoteSubtable {
+                id: "a".into(),
+                name: "收入".into(),
+            },
+            RemoteSubtable {
+                id: "b".into(),
+                name: "支出".into(),
+            },
+        ])
     }
 
     fn fetch_content(&self, request: &ContentRequest) -> Result<Vec<u8>> {
@@ -43,6 +61,12 @@ impl RemoteSource for SmokeSource {
             }
             ContentRequest::Markdown { token, .. } if token == "obj-leaf" => {
                 Ok(b"# Leaf\n".to_vec())
+            }
+            ContentRequest::Markdown { token, .. } if token == "obj-note" => {
+                Ok(b"# Note\n".to_vec())
+            }
+            ContentRequest::TableCsv { sub_id, .. } => {
+                Ok(format!("name,value\r\n{sub_id},10\r\n").into_bytes())
             }
             ContentRequest::Whiteboard { .. } => Ok(b"\xff\xd8\xffimage".to_vec()),
             ContentRequest::Inline { bytes } => Ok(bytes.clone()),
@@ -64,6 +88,12 @@ impl RemoteSource for SmokeSource {
         }
         Ok(bundle)
     }
+}
+
+fn table_node(token: &str, title: &str, kind: &str, has_child: bool) -> RemoteNode {
+    let mut node = remote_node(token, title, has_child);
+    node.object_type = Some(kind.into());
+    node
 }
 
 fn node(token: &str, title: &str) -> RemoteNode {
@@ -137,6 +167,23 @@ fn mounts_reads_and_rejects_writes() {
         fs::read_to_string(mountpoint.join("Root/Child/Leaf.md")).unwrap(),
         "# Leaf\n"
     );
+    for path in ["报表.收入.csv", "数据/数据.收入.csv"] {
+        assert_eq!(
+            fs::read(mountpoint.join(path)).unwrap(),
+            b"name,value\r\na,10\r\n"
+        );
+        assert!(fs::write(mountpoint.join(path), b"changed").is_err());
+    }
+    assert_eq!(
+        fs::read(mountpoint.join("报表.支出.csv")).unwrap(),
+        b"name,value\r\nb,10\r\n"
+    );
+    assert_eq!(
+        fs::read_to_string(mountpoint.join("数据/说明.md")).unwrap(),
+        "# Note\n"
+    );
+    assert!(!mountpoint.join("报表.xlsx").exists());
+    assert!(!mountpoint.join("数据/index.csv").exists());
     assert!(fs::write(mountpoint.join("Root/index.md"), "changed").is_err());
     assert!(fs::write(mountpoint.join("new.md"), "new").is_err());
 

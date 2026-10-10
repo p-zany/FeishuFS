@@ -10,23 +10,36 @@ pub(crate) fn rewrite_document_links(
     current_file: &str,
     content_path_by_token: &HashMap<String, String>,
 ) -> String {
-    rewrite_document_links_with_assets(
-        markdown,
-        current_file,
-        content_path_by_token,
-        &HashMap::new(),
-    )
+    let targets = content_path_by_token
+        .iter()
+        .map(|(token, path)| {
+            (
+                token.clone(),
+                DocumentTarget {
+                    path: path.clone(),
+                    subtables: HashMap::new(),
+                },
+            )
+        })
+        .collect();
+    rewrite_document_links_with_assets(markdown, current_file, &targets, &HashMap::new())
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DocumentTarget {
+    pub path: String,
+    pub subtables: HashMap<String, String>,
 }
 
 struct LinkTargets<'a> {
-    documents: &'a HashMap<String, String>,
+    documents: &'a HashMap<String, DocumentTarget>,
     assets: &'a HashMap<String, String>,
 }
 
 pub(crate) fn rewrite_document_links_with_assets(
     markdown: &str,
     current_file: &str,
-    documents: &HashMap<String, String>,
+    documents: &HashMap<String, DocumentTarget>,
     assets: &HashMap<String, String>,
 ) -> String {
     let targets = LinkTargets { documents, assets };
@@ -234,7 +247,18 @@ fn local_destination(
     }
     let link = destination.parse::<KnowledgeLink>().ok()?;
     let target = targets.documents.get(&link.token)?;
-    let mut relative = relative_file_path(current_file, target);
+    let selector = link.url.query_pairs().find_map(|(key, value)| {
+        matches!(key.as_ref(), "sheet" | "table").then(|| value.into_owned())
+    });
+    let path = if !target.subtables.is_empty()
+        && let Some(id) = selector
+    {
+        // Never rewrite an unknown selected subtable to a different CSV.
+        target.subtables.get(&id)?
+    } else {
+        &target.path
+    };
+    let mut relative = relative_file_path(current_file, path);
     relative = relative.replace('%', "%25").replace('#', "%23");
     if let Some(fragment) = link.url.fragment().filter(|fragment| !fragment.is_empty()) {
         relative.push('#');

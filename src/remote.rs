@@ -27,6 +27,22 @@ pub struct RemoteSpace {
     pub name: String,
 }
 
+/// One worksheet in a sheet or one data table in a bitable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteSubtable {
+    pub id: String,
+    pub name: String,
+}
+
+impl RemoteNode {
+    #[must_use]
+    pub fn is_table(&self) -> bool {
+        self.object_type.as_deref().is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("sheet") || kind.eq_ignore_ascii_case("bitable")
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContentRequest {
     Markdown {
@@ -45,6 +61,12 @@ pub enum ContentRequest {
         token: String,
         document_type: String,
         extension: String,
+    },
+    /// CSV always identifies exactly one worksheet or data table.
+    TableCsv {
+        token: String,
+        document_type: String,
+        sub_id: String,
     },
     Inline {
         bytes: Vec<u8>,
@@ -97,6 +119,10 @@ pub trait RemoteSource: Send + Sync + 'static {
     /// List the direct children of `parent`; implementations may skip the
     /// request when `parent.has_child` is false.
     fn list_children(&self, space_id: &str, parent: &RemoteNode) -> Result<Vec<RemoteNode>>;
+    /// Read only subtable metadata, never export content during traversal.
+    fn list_subtables(&self, _node: &RemoteNode) -> Result<Vec<RemoteSubtable>> {
+        bail!("Subtable listing is not supported by this remote source");
+    }
     fn fetch_content(&self, request: &ContentRequest) -> Result<Vec<u8>>;
     fn fetch_bundle(&self, request: &ContentRequest) -> Result<ContentBundle> {
         self.fetch_content(request).map(ContentBundle::from)
@@ -112,6 +138,8 @@ pub struct RemoteTree {
     pub root_nodes: Vec<RemoteNode>,
     /// Children keyed by parent `node_token`.
     pub children: HashMap<String, Vec<RemoteNode>>,
+    /// Complete subtable manifests keyed by the owning wiki node token.
+    pub subtables: HashMap<String, Vec<RemoteSubtable>>,
 }
 
 impl RemoteTree {
@@ -144,6 +172,7 @@ impl RemoteTree {
             title: space.name,
             root_nodes: Vec::new(),
             children: HashMap::new(),
+            subtables: HashMap::new(),
         };
 
         let root = RemoteNode {
@@ -215,6 +244,32 @@ impl RemoteTree {
                         child.node_token
                     ));
                 }
+                if child.is_table()
+                    && child
+                        .object_token
+                        .as_deref()
+                        .is_some_and(|token| !token.is_empty())
+                {
+                    let mut subtables = source.list_subtables(&child).with_context(|| {
+                        format!("Failed to list subtables of node {}", child.node_token)
+                    })?;
+                    let mut ids = HashSet::new();
+                    for table in &mut subtables {
+                        if !crate::docx::valid_token(&table.id) || !ids.insert(table.id.clone()) {
+                            bail!(
+                                "Invalid or duplicate subtable ID for node {}",
+                                child.node_token
+                            );
+                        }
+                        if table.name.trim().is_empty() {
+                            table.name = format!("Untitled-{}", table.id);
+                        }
+                    }
+                    // API order is not part of the snapshot identity. IDs also
+                    // provide a stable default target for links without a selector.
+                    subtables.sort_by(|a, b| a.id.cmp(&b.id));
+                    tree.subtables.insert(child.node_token.clone(), subtables);
+                }
                 if child.has_child {
                     queue.push_back(child.clone());
                 }
@@ -275,6 +330,7 @@ pub(crate) mod test_support {
 
     type ContentResult = Result<Vec<u8>, String>;
     type ContentMap = HashMap<String, ContentResult>;
+    type SubtableMap = HashMap<String, Result<Vec<RemoteSubtable>, String>>;
 
     #[derive(Clone, Default)]
     pub struct FakeSource {
@@ -283,6 +339,8 @@ pub(crate) mod test_support {
         pub content: Arc<Mutex<ContentMap>>,
         pub fetches: Arc<Mutex<Vec<String>>>,
         pub bundles: Arc<Mutex<HashMap<String, ContentBundle>>>,
+        pub subtables: Arc<Mutex<SubtableMap>>,
+        pub subtable_lists: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeSource {
@@ -315,8 +373,19 @@ pub(crate) mod test_support {
                 .unwrap_or_default())
         }
 
+        fn list_subtables(&self, node: &RemoteNode) -> Result<Vec<RemoteSubtable>> {
+            let token = node.object_token.as_ref().context("missing table token")?;
+            self.subtable_lists.lock().push(token.clone());
+            match self.subtables.lock().get(token).cloned() {
+                Some(Ok(tables)) => Ok(tables),
+                Some(Err(message)) => bail!(message),
+                None => bail!("fake subtables not configured for {token}"),
+            }
+        }
+
         fn fetch_content(&self, request: &ContentRequest) -> Result<Vec<u8>> {
             let key = match request {
+                ContentRequest::TableCsv { token, sub_id, .. } => format!("{token}/{sub_id}"),
                 ContentRequest::Markdown { token, .. }
                 | ContentRequest::Download { token }
                 | ContentRequest::Whiteboard { token }
@@ -455,6 +524,47 @@ mod tests {
             tree.root_nodes[0].url.as_deref(),
             Some("https://tenant.larksuite.com/wiki/a")
         );
+    }
+
+    #[test]
+    fn invalid_or_duplicate_subtable_ids_reject_the_entire_snapshot() {
+        let source = FakeSource::with_root(node("root", "Root", "docx"));
+        source
+            .children
+            .lock()
+            .insert("space-1".into(), vec![leaf("table", "Table", "sheet")]);
+        for ids in [vec![""], vec!["../escape"], vec!["a", "a"]] {
+            source.subtables.lock().insert(
+                "obj-table".into(),
+                Ok(ids
+                    .into_iter()
+                    .map(|id| RemoteSubtable {
+                        id: id.into(),
+                        name: "Name".into(),
+                    })
+                    .collect()),
+            );
+            assert!(RemoteTree::load(&source, &link(), 10).is_err());
+        }
+    }
+
+    #[test]
+    fn unnamed_subtables_use_their_stable_id_without_exporting_content() {
+        let source = FakeSource::with_root(node("root", "Root", "docx"));
+        source
+            .children
+            .lock()
+            .insert("space-1".into(), vec![leaf("table", "Table", "bitable")]);
+        source.subtables.lock().insert(
+            "obj-table".into(),
+            Ok(vec![RemoteSubtable {
+                id: "tbl1".into(),
+                name: "  ".into(),
+            }]),
+        );
+        let tree = RemoteTree::load(&source, &link(), 10).unwrap();
+        assert_eq!(tree.subtables["table"][0].name, "Untitled-tbl1");
+        assert!(source.fetches.lock().is_empty());
     }
 
     #[test]

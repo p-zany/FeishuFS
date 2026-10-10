@@ -818,6 +818,10 @@ fn platform_name_eq(left: &[u8], right: &[u8]) -> bool {
 mod refresh_tests;
 
 #[cfg(test)]
+#[path = "table_tests.rs"]
+mod table_tests;
+
+#[cfg(test)]
 mod tests {
     use std::thread;
 

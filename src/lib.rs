@@ -14,5 +14,6 @@ pub use filesystem::{FeishuFs, FsOptions, RefreshHandle, RefreshSummary};
 pub use link::KnowledgeLink;
 pub use openlark::{OpenLarkOptions, OpenLarkSource};
 pub use remote::{
-    ContentAsset, ContentBundle, ContentRequest, RemoteNode, RemoteSource, RemoteSpace, RemoteTree,
+    ContentAsset, ContentBundle, ContentRequest, RemoteNode, RemoteSource, RemoteSpace,
+    RemoteSubtable, RemoteTree,
 };

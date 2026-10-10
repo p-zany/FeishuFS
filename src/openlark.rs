@@ -1,4 +1,4 @@
-use std::{sync::Arc, thread, time::Duration};
+use std::{collections::HashSet, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use openlark_auth::AuthTokenProvider;
@@ -9,11 +9,13 @@ use openlark_core::{
     req_option::RequestOption,
 };
 use openlark_docs::{
+    base::bitable::v1::app::table::list::ListTablesRequest,
     ccm::{
         drive::v1::{
             CreateExportTaskRequest, DownloadExportRequest, GetExportTaskRequest,
             file::DownloadFileRequest,
         },
+        sheets::v3::spreadsheet::sheet::query::query_sheets_with_options,
         wiki::v2::space::{
             get::GetWikiSpaceRequest,
             get_node::{GetWikiSpaceNodeParams, GetWikiSpaceNodeRequest},
@@ -28,7 +30,8 @@ use crate::{
     docx::{image_extension, render_document, valid_token},
     link::KnowledgeLink,
     remote::{
-        ContentBundle, ContentRequest, RemoteNode, RemoteSource, RemoteSpace, SPACE_OBJECT_TYPE,
+        ContentBundle, ContentRequest, RemoteNode, RemoteSource, RemoteSpace, RemoteSubtable,
+        SPACE_OBJECT_TYPE,
     },
     sdk_error::SdkError,
 };
@@ -223,13 +226,21 @@ impl OpenLarkSource {
         Ok(bytes)
     }
 
-    fn export(&self, token: &str, document_type: &str, extension: &str) -> Result<Vec<u8>> {
+    fn export(
+        &self,
+        token: &str,
+        document_type: &str,
+        extension: &str,
+        sub_id: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let mut request =
+            CreateExportTaskRequest::new(self.config.clone(), extension, token, document_type);
+        if let Some(sub_id) = sub_id {
+            request = request.sub_id(sub_id);
+        }
         let created = self
             .runtime
-            .block_on(
-                CreateExportTaskRequest::new(self.config.clone(), extension, token, document_type)
-                    .execute_with_options(self.request_option()),
-            )
+            .block_on(request.execute_with_options(self.request_option()))
             .map_err(SdkError)
             .with_context(|| {
                 format!("Failed to create a {extension} export task for {document_type} document {token}")
@@ -272,6 +283,13 @@ impl OpenLarkSource {
                                 created.ticket
                             )
                         })?;
+                    if response.raw_response.code != 0 {
+                        bail!(
+                            "Export download API error {}: {}",
+                            response.raw_response.code,
+                            response.raw_response.msg
+                        );
+                    }
                     return response.data.with_context(|| {
                         format!("Export task {} returned no data", created.ticket)
                     });
@@ -374,6 +392,88 @@ impl RemoteSource for OpenLarkSource {
         Ok(children)
     }
 
+    fn list_subtables(&self, node: &RemoteNode) -> Result<Vec<RemoteSubtable>> {
+        let token = node
+            .object_token
+            .as_deref()
+            .context("Table has no obj_token")?;
+        if !valid_token(token) {
+            bail!("Invalid table token");
+        }
+        if node
+            .object_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("sheet"))
+        {
+            let response = self
+                .runtime
+                .block_on(query_sheets_with_options(
+                    &self.config,
+                    token,
+                    self.request_option(),
+                ))
+                .map_err(SdkError)
+                .with_context(|| {
+                    format!("Failed to list worksheets for {token}; check sheets read permissions")
+                })?;
+            return Ok(response
+                .sheets
+                .into_iter()
+                .map(|sheet| RemoteSubtable {
+                    id: sheet.sheet_id,
+                    name: sheet.title,
+                })
+                .collect());
+        }
+        if !node
+            .object_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("bitable"))
+        {
+            bail!("Subtable listing requires a sheet or bitable node");
+        }
+        let mut tables = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let mut request = ListTablesRequest::new(self.config.clone())
+                .app_token(token.to_owned())
+                .page_size(100);
+            if let Some(page) = &page_token {
+                request = request.page_token(page.clone());
+            }
+            let response = self
+                .runtime
+                .block_on(request.execute_with_options(self.request_option()))
+                .map_err(SdkError)
+                .with_context(|| {
+                    format!(
+                        "Failed to list data tables for {token}; check bitable read permissions"
+                    )
+                })?;
+            for table in response.items {
+                let id = table
+                    .table_id
+                    .context("Data table response is missing table_id")?;
+                tables.push(RemoteSubtable {
+                    id,
+                    name: table.name.unwrap_or_default(),
+                });
+            }
+            if !response.has_more {
+                return Ok(tables);
+            }
+            let next = response
+                .page_token
+                .filter(|token| !token.trim().is_empty())
+                .context("Data table response has_more=true but has no page_token")?;
+            if !seen.insert(next.clone()) {
+                bail!("Data table pagination token did not advance; pagination stopped");
+            }
+            page_token = Some(next);
+        }
+    }
+
     fn fetch_content(&self, request: &ContentRequest) -> Result<Vec<u8>> {
         match request {
             ContentRequest::Markdown { .. } => {
@@ -398,7 +498,17 @@ impl RemoteSource for OpenLarkSource {
                 token,
                 document_type,
                 extension,
-            } => self.export(token, document_type, extension),
+            } => self.export(token, document_type, extension, None),
+            ContentRequest::TableCsv {
+                token,
+                document_type,
+                sub_id,
+            } => {
+                if !matches!(document_type.as_str(), "sheet" | "bitable") || !valid_token(sub_id) {
+                    bail!("CSV export requires a sheet or bitable and a valid subtable ID");
+                }
+                self.export(token, document_type, "csv", Some(sub_id))
+            }
             ContentRequest::Inline { bytes } => Ok(bytes.clone()),
         }
     }
