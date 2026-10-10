@@ -19,6 +19,7 @@ devenv.local.yaml
 
 # Local mounts and caches
 /mnt/
+/wiki/
 /.cache/
 
 # Logs and editor files

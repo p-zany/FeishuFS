@@ -5,6 +5,8 @@
 }:
 
 {
+  dotenv.enable = true;
+
   languages.rust = {
     enable = true;
     channel = "stable";
@@ -14,14 +16,9 @@
 
   packages = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
     pkgs.cargo-xwin
+    pkgs.lark-cli
     pkgs.llvmPackages.llvm
   ];
-
-  env.FUSERMOUNT_PATH = "/run/wrappers/bin/fusermount3";
-
-  enterShell = ''
-    export PATH="/run/wrappers/bin:$PATH"
-  '';
 
   git-hooks.hooks = {
     rustfmt.enable = true;
