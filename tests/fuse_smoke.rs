@@ -101,6 +101,7 @@ fn mounts_reads_and_rejects_writes() {
         FsOptions {
             cache_ttl: Duration::from_secs(60),
             max_nodes: 10,
+            ..FsOptions::default()
         },
     )
     .unwrap();

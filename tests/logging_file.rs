@@ -66,6 +66,7 @@ fn log_file_records_the_feishu_error_chain() {
         FsOptions {
             cache_ttl: std::time::Duration::from_secs(60),
             max_nodes: 10,
+            ..FsOptions::default()
         },
     )
     .unwrap();

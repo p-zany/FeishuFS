@@ -27,7 +27,7 @@ mod implementation {
     use std::{
         collections::HashSet,
         os::windows::ffi::OsStrExt,
-        sync::atomic::{AtomicBool, AtomicIsize, Ordering},
+        sync::atomic::{AtomicIsize, AtomicUsize, Ordering},
     };
 
     use fsk::{
@@ -44,14 +44,14 @@ mod implementation {
 
     pub(crate) struct ProjectionController {
         namespace_context: AtomicIsize,
-        internal_update: AtomicBool,
+        internal_updates: AtomicUsize,
     }
 
     impl Default for ProjectionController {
         fn default() -> Self {
             Self {
                 namespace_context: AtomicIsize::new(0),
-                internal_update: AtomicBool::new(false),
+                internal_updates: AtomicUsize::new(0),
             }
         }
     }
@@ -79,7 +79,7 @@ mod implementation {
 
             if event.operation == Operation::Notification
                 && is_mutating_notification(flags)
-                && !(self.internal_update.load(Ordering::Acquire)
+                && !(self.internal_updates.load(Ordering::Acquire) > 0
                     && event.caller.process_id == std::process::id())
             {
                 return RawOutcome::Reject(Error(13));
@@ -88,9 +88,12 @@ mod implementation {
         }
 
         pub fn invalidate(&self, old_paths: Vec<String>, new_paths: Vec<String>) {
+            if old_paths.is_empty() && new_paths.is_empty() {
+                return;
+            }
             let context = self.namespace_context.load(Ordering::Acquire);
             if context == 0 {
-                debug!("ProjFS 尚未产生回调，延后清理 Windows 投影缓存");
+                debug!("ProjFS has not issued a callback; deferring projection invalidation");
                 return;
             }
 
@@ -108,7 +111,8 @@ mod implementation {
                     .then_with(|| right.len().cmp(&left.len()))
             });
 
-            self.internal_update.store(true, Ordering::Release);
+            // Independent refresh workers may invalidate projections concurrently.
+            self.internal_updates.fetch_add(1, Ordering::AcqRel);
             let context = context as *mut core::ffi::c_void;
             for path in paths {
                 let windows_path = path.replace('/', "\\");
@@ -135,15 +139,15 @@ mod implementation {
                         hresult =
                             format_args!("0x{:08x}", u32::from_ne_bytes(result.to_ne_bytes())),
                         failure,
-                        "ProjFS 缓存项无需删除或当前不可删除"
+                        "ProjFS cache entry is absent or cannot currently be removed"
                     );
                 }
             }
             let mut cleared = 0_u32;
             // SAFETY: context belongs to the active projection and `cleared` is writable.
             let _ = unsafe { PrjClearNegativePathCache(context, &raw mut cleared) };
-            self.internal_update.store(false, Ordering::Release);
-            debug!(cleared, "Windows ProjFS 投影缓存刷新完成");
+            self.internal_updates.fetch_sub(1, Ordering::AcqRel);
+            debug!(cleared, "Windows ProjFS projection cache invalidated");
         }
     }
 

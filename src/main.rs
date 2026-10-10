@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -15,17 +15,17 @@ use tracing::{error, info};
 #[command(
     name = "feishufs",
     version,
-    about = "将飞书/Lark 知识库挂载为本地只读文件系统"
+    about = "Mount a Feishu/Lark space as a read-only filesystem"
 )]
 struct Cli {
     #[arg(short, long, action = ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// 详细日志文件（默认：当前目录的 feishufs.log）
+    /// Detailed log file (default: feishufs.log in the working directory)
     #[arg(long, env = "FEISHUFS_LOG_FILE", global = true, value_name = "PATH")]
     log_file: Option<PathBuf>,
 
-    /// 不写日志文件，只输出到终端
+    /// Disable the log file and write only to the console
     #[arg(long, global = true)]
     no_log_file: bool,
 
@@ -35,50 +35,58 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// 验证链接和权限，并预览文件系统目录树
+    /// Validate permissions and preview the filesystem tree
     Inspect(CommonArgs),
-    /// 将知识库挂载到本地目录
+    /// Mount a space at a local directory
     Mount(MountArgs),
 }
 
 #[derive(Clone, Debug, Args)]
 struct CommonArgs {
-    /// 知识库空间内任意文档的链接（用于定位要挂载的整个知识库）
+    /// A document URL used to select the entire space at startup
     wiki_url: String,
 
-    /// 飞书自建应用 App ID
+    /// Feishu custom application ID
     #[arg(long, env = "FEISHU_APP_ID")]
     app_id: String,
 
-    /// 飞书自建应用 App Secret（推荐只通过环境变量传入）
+    /// Feishu application secret (prefer an environment variable)
     #[arg(long, env = "FEISHU_APP_SECRET", hide_env_values = true)]
     app_secret: String,
 
-    /// 可选的用户访问令牌
+    /// Optional user access token
     #[arg(long, env = "FEISHU_USER_ACCESS_TOKEN", hide_env_values = true)]
     user_access_token: Option<String>,
 
-    /// OpenAPI base URL；默认根据飞书/Lark 链接自动判断
+    /// OpenAPI base URL (inferred from the Feishu/Lark URL by default)
     #[arg(long, env = "FEISHU_API_BASE_URL")]
     api_base_url: Option<String>,
 
-    /// 允许非飞书官方域名的 API base URL
+    /// Allow an API base URL outside the official Feishu/Lark domains
     #[arg(long, default_value_t = false)]
     allow_custom_api_base_url: bool,
 
-    /// 目录与内容缓存刷新周期
+    /// Delay between completed directory refresh attempts
     #[arg(long, default_value = "60s", value_parser = parse_duration)]
     refresh_interval: Duration,
 
-    /// 单次挂载允许的最大知识库节点数
+    /// Content cache lifetime, independent of the directory refresh interval
+    #[arg(long, default_value = "60s", value_parser = parse_duration)]
+    content_ttl: Duration,
+
+    /// Cooldown after a failed content fetch, including first-fetch failures
+    #[arg(long, default_value = "5s", value_parser = parse_duration)]
+    content_retry_interval: Duration,
+
+    /// Maximum number of nodes in a mounted space
     #[arg(long, default_value_t = 10_000)]
     max_nodes: usize,
 
-    /// 单个下载/导出文件的最大 MiB
+    /// Maximum download/export size per file in MiB
     #[arg(long, default_value_t = 100)]
     max_download_mib: usize,
 
-    /// 单个 OpenAPI 请求超时
+    /// Timeout for each OpenAPI request
     #[arg(long, default_value = "30s", value_parser = parse_duration)]
     request_timeout: Duration,
 }
@@ -88,7 +96,7 @@ struct MountArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// 本地挂载目录
+    /// Local mountpoint
     mountpoint: PathBuf,
 }
 
@@ -107,8 +115,8 @@ fn main() -> ExitCode {
     match run(cli.command, log_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            error!(error = %format!("{error:#}"), "命令失败");
-            eprintln!("错误：{error:#}");
+            error!(error = %format!("{error:#}"), "Command failed");
+            eprintln!("Error: {error:#}");
             ExitCode::FAILURE
         }
     }
@@ -118,9 +126,9 @@ fn run(command: Command, log_path: Option<PathBuf>) -> Result<()> {
     match command {
         Command::Inspect(args) => {
             let filesystem = connect(&args)?;
-            println!("知识库：{}", filesystem.root_title());
-            println!("节点数：{}", filesystem.node_count());
-            println!("映射预览：");
+            println!("Space: {}", filesystem.root_title());
+            println!("Nodes: {}", filesystem.node_count());
+            println!("Filesystem preview:");
             for line in filesystem.tree_lines() {
                 println!("  {line}");
             }
@@ -131,14 +139,11 @@ fn run(command: Command, log_path: Option<PathBuf>) -> Result<()> {
 }
 
 fn connect(args: &CommonArgs) -> Result<FeishuFs> {
-    if args.refresh_interval.is_zero() {
-        bail!("--refresh-interval 必须大于 0");
-    }
-    let link: KnowledgeLink = args.wiki_url.parse().context("知识库链接无效")?;
+    let link: KnowledgeLink = args.wiki_url.parse().context("Invalid space URL")?;
     let max_download_bytes = args
         .max_download_mib
         .checked_mul(1024 * 1024)
-        .context("--max-download-mib 数值过大")?;
+        .context("--max-download-mib is too large")?;
     let api_base_url = args
         .api_base_url
         .clone()
@@ -156,8 +161,10 @@ fn connect(args: &CommonArgs) -> Result<FeishuFs> {
         Arc::new(source),
         link,
         FsOptions {
-            cache_ttl: args.refresh_interval,
+            cache_ttl: args.content_ttl,
+            content_retry_interval: args.content_retry_interval,
             max_nodes: args.max_nodes,
+            ..FsOptions::default()
         },
     )
 }
@@ -167,40 +174,51 @@ fn mount(args: MountArgs, log_path: Option<PathBuf>) -> Result<()> {
     let filesystem = connect(&args.common)?;
     let session = mount_session(filesystem.clone(), &args.mountpoint)
         .with_context(|| platform_mount_hint(&args.mountpoint))?;
-    let _refresher = filesystem.start_refresher(args.common.refresh_interval);
+    let refresher = filesystem.start_refresher(args.common.refresh_interval);
 
-    println!("已挂载：{}", args.mountpoint.display());
-    println!("知识库：{}", filesystem.root_title());
+    println!("Mounted: {}", args.mountpoint.display());
+    println!("Space: {}", filesystem.root_title());
     println!(
-        "刷新周期：{}",
+        "Directory refresh delay: {}",
         humantime::format_duration(args.common.refresh_interval)
     );
+    println!(
+        "Content TTL: {}",
+        humantime::format_duration(args.common.content_ttl)
+    );
     match &log_path {
-        Some(path) => println!("日志：{}", path.display()),
-        None => println!("日志：仅终端（已关闭日志文件）"),
+        Some(path) => println!("Log file: {}", path.display()),
+        None => println!("Logging: console only (log file disabled)"),
     }
-    println!("按 Ctrl-C 卸载并退出。");
-    info!(mountpoint = %args.mountpoint.display(), "FeishuFS 挂载成功");
+    println!("Press Ctrl-C to unmount and exit.");
+    info!(mountpoint = %args.mountpoint.display(), "FeishuFS mounted");
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     ctrlc::set_handler(move || {
         let _ = shutdown_tx.send(());
     })
-    .context("无法安装 Ctrl-C 处理器")?;
-    shutdown_rx.recv().context("退出信号通道异常关闭")?;
+    .context("Failed to install the Ctrl-C handler")?;
+    shutdown_rx
+        .recv()
+        .context("Shutdown signal channel closed unexpectedly")?;
+    // Stop workers while their platform invalidation context is still alive.
+    drop(refresher);
     drop(session);
-    info!("FeishuFS 已卸载");
+    info!("FeishuFS unmounted");
     Ok(())
 }
 
 fn validate_mountpoint(path: &Path) -> Result<()> {
     if path.exists() && !path.is_dir() {
-        bail!("挂载点 {} 已存在但不是目录", path.display());
+        bail!(
+            "Mountpoint {} exists but is not a directory",
+            path.display()
+        );
     }
     #[cfg(target_os = "windows")]
     if path.exists() && path.read_dir()?.next().is_some() {
         bail!(
-            "Windows ProjFS 挂载点必须为空；{} 当前包含文件",
+            "Windows ProjFS requires an empty mountpoint; {} contains files",
             path.display()
         );
     }
@@ -233,14 +251,14 @@ fn mount_session(filesystem: FeishuFs, mountpoint: &Path) -> std::io::Result<Mou
 fn mount_session(_filesystem: FeishuFs, _mountpoint: &Path) -> std::io::Result<MountSession> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "当前版本只发布 Linux 和 Windows 挂载后端",
+        "Only Linux and Windows mount backends are supported",
     ))
 }
 
 #[cfg(target_os = "linux")]
 fn platform_mount_hint(mountpoint: &Path) -> String {
     format!(
-        "无法在 {} 建立 FUSE 挂载；请确认 /dev/fuse 可用且已安装 fuse3/fusermount3",
+        "Failed to mount FUSE at {}; check /dev/fuse and fuse3/fusermount3 availability",
         mountpoint.display()
     )
 }
@@ -248,16 +266,65 @@ fn platform_mount_hint(mountpoint: &Path) -> String {
 #[cfg(target_os = "windows")]
 fn platform_mount_hint(mountpoint: &Path) -> String {
     format!(
-        "无法在 {} 建立 ProjFS 投影；请以管理员 PowerShell 启用 Client-ProjFS，并使用空的 NTFS 目录",
+        "Failed to start ProjFS at {}; enable Client-ProjFS in administrator PowerShell and use an empty NTFS directory",
         mountpoint.display()
     )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn platform_mount_hint(mountpoint: &Path) -> String {
-    format!("当前平台不支持挂载 {}", mountpoint.display())
+    format!(
+        "Mounting {} is not supported on this platform",
+        mountpoint.display()
+    )
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
-    humantime::parse_duration(value).map_err(|error| error.to_string())
+    let duration = humantime::parse_duration(value).map_err(|error| error.to_string())?;
+    if duration.is_zero()
+        || Instant::now()
+            .checked_add(duration.saturating_mul(8))
+            .is_none()
+    {
+        return Err("Duration must be positive and representable".into());
+    }
+    Ok(duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_interval_and_content_ttl_are_independent() {
+        let cli = Cli::try_parse_from([
+            "feishufs",
+            "inspect",
+            "https://example.feishu.cn/wiki/doc",
+            "--app-id",
+            "test-app",
+            "--app-secret",
+            "test-secret",
+            "--refresh-interval",
+            "5m",
+            "--content-ttl",
+            "30s",
+            "--content-retry-interval",
+            "2s",
+        ])
+        .unwrap();
+        let Command::Inspect(args) = cli.command else {
+            panic!("Inspect expected")
+        };
+        assert_eq!(args.refresh_interval, Duration::from_secs(300));
+        assert_eq!(args.content_ttl, Duration::from_secs(30));
+        assert_eq!(args.content_retry_interval, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn durations_must_be_positive() {
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("invalid").is_err());
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+    }
 }

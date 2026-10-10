@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, mpsc},
+    sync::{Arc, Weak, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -15,11 +15,12 @@ use fsk::{
     raw::{RawEvent, RawEventMask, RawOutcome},
 };
 use parking_lot::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     link::KnowledgeLink,
     platform::ProjectionController,
+    refresh::{FetchSlots, RefreshBackoff},
     remote::{ContentBundle, ContentRequest, RemoteSource, RemoteSpace, RemoteTree},
     tree::{FsState, VirtualNode, VirtualNodeKind, directory_entries, file_request},
 };
@@ -32,6 +33,8 @@ const IS_DIRECTORY: FsError = FsError(21);
 #[derive(Clone, Copy, Debug)]
 pub struct FsOptions {
     pub cache_ttl: Duration,
+    pub content_retry_interval: Duration,
+    pub max_concurrent_fetches: usize,
     pub max_nodes: usize,
 }
 
@@ -39,6 +42,8 @@ impl Default for FsOptions {
     fn default() -> Self {
         Self {
             cache_ttl: Duration::from_secs(60),
+            content_retry_interval: Duration::from_secs(5),
+            max_concurrent_fetches: 4,
             max_nodes: 10_000,
         }
     }
@@ -55,10 +60,13 @@ struct Inner {
     space_id: String,
     state: RwLock<FsState>,
     content: Mutex<HashMap<u64, CachedContent>>,
-    fetch_gate: Mutex<()>,
+    failures: Mutex<HashMap<u64, FetchFailure>>,
+    fetch_gates: Mutex<HashMap<u64, Weak<Mutex<()>>>>,
+    fetch_slots: FetchSlots,
     publish_gate: Mutex<()>,
     refresh_gate: Mutex<()>,
     cache_ttl: Duration,
+    content_retry_interval: Duration,
     max_nodes: usize,
     projection: ProjectionController,
 }
@@ -74,6 +82,11 @@ struct CachedContent {
     tree_revision: u64,
 }
 
+struct FetchFailure {
+    request: ContentRequest,
+    retry_at: Instant,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefreshSummary {
     pub node_count: usize,
@@ -86,11 +99,16 @@ impl FeishuFs {
         link: KnowledgeLink,
         options: FsOptions,
     ) -> Result<Self> {
-        if options.cache_ttl.is_zero() {
-            bail!("cache_ttl must be greater than zero");
+        for (name, duration) in [
+            ("cache_ttl", options.cache_ttl),
+            ("content_retry_interval", options.content_retry_interval),
+        ] {
+            if duration.is_zero() || Instant::now().checked_add(duration).is_none() {
+                bail!("{name} must be a positive, representable duration");
+            }
         }
-        if options.max_nodes == 0 {
-            bail!("max_nodes must be greater than zero");
+        if options.max_nodes == 0 || options.max_concurrent_fetches == 0 {
+            bail!("max_nodes and max_concurrent_fetches must be greater than zero");
         }
         let tree = RemoteTree::load(source.as_ref(), &link, options.max_nodes)?;
         let state = FsState::from_remote(&tree, now_ns())
@@ -102,10 +120,13 @@ impl FeishuFs {
                 space_id: tree.space_id,
                 state: RwLock::new(state),
                 content: Mutex::new(HashMap::new()),
-                fetch_gate: Mutex::new(()),
+                failures: Mutex::new(HashMap::new()),
+                fetch_gates: Mutex::new(HashMap::new()),
+                fetch_slots: FetchSlots::new(options.max_concurrent_fetches),
                 publish_gate: Mutex::new(()),
                 refresh_gate: Mutex::new(()),
                 cache_ttl: options.cache_ttl,
+                content_retry_interval: options.content_retry_interval,
                 max_nodes: options.max_nodes,
                 projection: ProjectionController::new(),
             }),
@@ -138,6 +159,14 @@ impl FeishuFs {
                 .content
                 .lock()
                 .retain(|inode, _| active_files.contains(inode));
+            self.inner
+                .failures
+                .lock()
+                .retain(|inode, _| active_files.contains(inode));
+            self.inner
+                .fetch_gates
+                .lock()
+                .retain(|inode, gate| active_files.contains(inode) || gate.strong_count() > 0);
         }
         drop(publication);
         if let Some((old_paths, new_paths, _)) = changes {
@@ -151,36 +180,71 @@ impl FeishuFs {
 
     #[must_use]
     pub fn start_refresher(&self, interval: Duration) -> RefreshHandle {
+        assert!(
+            !interval.is_zero()
+                && Instant::now()
+                    .checked_add(interval.saturating_mul(8))
+                    .is_some(),
+            "The refresh interval must be positive and representable"
+        );
         let (stop_tx, stop_rx) = mpsc::channel();
         let filesystem = self.clone();
         let join = thread::Builder::new()
             .name("feishufs-refresh".into())
             .spawn(move || {
-                loop {
-                    match stop_rx.recv_timeout(interval) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => match filesystem.refresh_now() {
-                            Ok(summary) => {
+                let mut backoff = RefreshBackoff::new(interval);
+                let mut delay = interval;
+                while matches!(
+                    stop_rx.recv_timeout(delay),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    match filesystem.refresh_now() {
+                        Ok(summary) => {
+                            delay = backoff.complete(true);
+                            if summary.revision_changed {
                                 info!(
                                     nodes = summary.node_count,
                                     "Space directory snapshot updated"
-                                )
-                            }
-                            Err(error) => {
-                                crate::logging::failure(
-                                    "Directory refresh failed; retaining the previous snapshot",
-                                    &error,
+                                );
+                            } else {
+                                debug!(
+                                    nodes = summary.node_count,
+                                    "Space directory snapshot is unchanged"
                                 );
                             }
-                        },
+                        }
+                        Err(error) => {
+                            delay = backoff.complete(false);
+                            crate::logging::failure(
+                                "Directory refresh failed; retaining the previous snapshot",
+                                &error,
+                            );
+                            debug!(retry_in = ?delay, "Directory refresh retry scheduled");
+                        }
                     }
                 }
             })
             .expect("Failed to spawn the directory refresh thread");
-        RefreshHandle {
-            stop_tx: Some(stop_tx),
-            join: Some(join),
+        #[allow(unused_mut)]
+        let mut workers = vec![(stop_tx, join)];
+        #[cfg(target_os = "windows")]
+        {
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let filesystem = self.clone();
+            let join = thread::Builder::new()
+                .name("feishufs-projection-refresh".into())
+                .spawn(move || {
+                    while matches!(
+                        stop_rx.recv_timeout(filesystem.inner.cache_ttl),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        filesystem.invalidate_expired_projections();
+                    }
+                })
+                .expect("Failed to spawn the projection refresh thread");
+            workers.push((stop_tx, join));
         }
+        RefreshHandle { workers }
     }
 
     #[must_use]
@@ -240,15 +304,37 @@ impl FeishuFs {
             self.inner.content.lock().insert(inode, rendered.clone());
             rendered
         });
+        let cooling_down = self
+            .inner
+            .failures
+            .lock()
+            .get(&inode)
+            .is_some_and(|failure| {
+                &failure.request == request && Instant::now() < failure.retry_at
+            });
         if let Some(cached) = existing {
             if !refresh_if_expired
                 || request.is_inline()
                 || cached.fetched_at.elapsed() < self.inner.cache_ttl
+                || cooling_down
             {
                 return Ok(Some(cached));
             }
+        } else if cooling_down {
+            return Err(FsError::IO);
         }
         Ok(None)
+    }
+
+    fn fetch_gate(&self, inode: u64) -> Arc<Mutex<()>> {
+        let mut gates = self.inner.fetch_gates.lock();
+        if let Some(gate) = gates.get(&inode).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(inode, Arc::downgrade(&gate));
+        gate
     }
 
     fn ensure_content(
@@ -260,14 +346,17 @@ impl FeishuFs {
             if let Some(cached) = self.cached_content(inode, refresh_if_expired)? {
                 return Ok(cached);
             }
-            let fetching = self.inner.fetch_gate.lock();
+            let gate = self.fetch_gate(inode);
+            let fetching = gate.lock();
             // Another reader may have completed the fetch while this one waited.
             if let Some(cached) = self.cached_content(inode, refresh_if_expired)? {
                 return Ok(cached);
             }
+            let permit = self.inner.fetch_slots.acquire();
             let node = self.node(inode)?;
             let request = file_request(&node).map_err(|_| IS_DIRECTORY)?.clone();
             let fetched = self.inner.source.fetch_bundle(&request);
+            drop(permit);
 
             let publication = self.inner.publish_gate.lock();
             let current = self.node(inode)?;
@@ -312,6 +401,7 @@ impl FeishuFs {
                         tree_revision,
                     };
                     self.inner.content.lock().insert(inode, cached.clone());
+                    self.inner.failures.lock().remove(&inode);
                     drop(publication);
                     drop(fetching);
                     if let Some((old_paths, new_paths)) = asset_paths {
@@ -320,6 +410,13 @@ impl FeishuFs {
                     return Ok(cached);
                 }
                 Err(error) => {
+                    self.inner.failures.lock().insert(
+                        inode,
+                        FetchFailure {
+                            request: request.clone(),
+                            retry_at: Instant::now() + self.inner.content_retry_interval,
+                        },
+                    );
                     drop(publication);
                     drop(fetching);
                     if let Some(cached) = existing.filter(|cached| cached.request == request) {
@@ -334,6 +431,43 @@ impl FeishuFs {
                     return Err(FsError::IO);
                 }
             }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn invalidate_expired_projections(&self) {
+        self.inner
+            .projection
+            .invalidate(self.expired_projection_paths(), Vec::new());
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn expired_projection_paths(&self) -> Vec<String> {
+        // ProjFS can satisfy opens without calling the provider. Expire only
+        // cached files, independently of directory changes and directory backoff.
+        {
+            let _publication = self.inner.publish_gate.lock();
+            let state = self.inner.state.read();
+            let content = self.inner.content.lock();
+            let failures = self.inner.failures.lock();
+            content
+                .iter()
+                .filter_map(|(inode, cached)| {
+                    let node = state.nodes.get(inode)?;
+                    let request = file_request(node).ok()?;
+                    if request.is_inline()
+                        || &cached.request != request
+                        || cached.fetched_at.elapsed() < self.inner.cache_ttl
+                        || failures.get(inode).is_some_and(|failure| {
+                            &failure.request == request && Instant::now() < failure.retry_at
+                        })
+                    {
+                        None
+                    } else {
+                        Some(node.path.clone())
+                    }
+                })
+                .collect()
         }
     }
 
@@ -367,8 +501,11 @@ impl FeishuFs {
         let active = state.file_inodes();
         let mut content = self.inner.content.lock();
         content.retain(|inode, _| active.contains(inode));
+        let mut failures = self.inner.failures.lock();
+        failures.retain(|inode, _| active.contains(inode));
         for asset in &bundle.assets {
             let inode = files[&asset.name];
+            failures.remove(&inode);
             let previous = content.get(&inode);
             let unchanged = previous.is_some_and(|cached| {
                 cached.request == asset.request && cached.bytes.as_ref() == asset.bytes
@@ -447,19 +584,18 @@ impl FeishuFs {
 }
 
 pub struct RefreshHandle {
-    stop_tx: Option<mpsc::Sender<()>>,
-    join: Option<thread::JoinHandle<()>>,
+    workers: Vec<(mpsc::Sender<()>, thread::JoinHandle<()>)>,
 }
 
 impl Drop for RefreshHandle {
     fn drop(&mut self) {
-        if let Some(stop_tx) = self.stop_tx.take() {
+        for (stop_tx, _) in &self.workers {
             let _ = stop_tx.send(());
         }
-        if let Some(join) = self.join.take()
-            && join.join().is_err()
-        {
-            warn!("A refresh worker panicked during shutdown");
+        for (_, join) in self.workers.drain(..) {
+            if join.join().is_err() {
+                warn!("A refresh worker panicked during shutdown");
+            }
         }
     }
 }
@@ -678,6 +814,10 @@ fn platform_name_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[path = "refresh_tests.rs"]
+mod refresh_tests;
+
+#[cfg(test)]
 mod tests {
     use std::thread;
 
@@ -703,6 +843,7 @@ mod tests {
             FsOptions {
                 cache_ttl,
                 max_nodes: 100,
+                ..FsOptions::default()
             },
         )
         .unwrap();
