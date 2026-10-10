@@ -4,11 +4,32 @@ use crate::link::KnowledgeLink;
 
 /// Rewrite Feishu/Lark links that point into the mounted subtree to local,
 /// relative filesystem paths. Formatting outside link destinations is retained.
+#[cfg(test)]
 pub(crate) fn rewrite_document_links(
     markdown: &str,
     current_file: &str,
     content_path_by_token: &HashMap<String, String>,
 ) -> String {
+    rewrite_document_links_with_assets(
+        markdown,
+        current_file,
+        content_path_by_token,
+        &HashMap::new(),
+    )
+}
+
+struct LinkTargets<'a> {
+    documents: &'a HashMap<String, String>,
+    assets: &'a HashMap<String, String>,
+}
+
+pub(crate) fn rewrite_document_links_with_assets(
+    markdown: &str,
+    current_file: &str,
+    documents: &HashMap<String, String>,
+    assets: &HashMap<String, String>,
+) -> String {
+    let targets = LinkTargets { documents, assets };
     let mut output = String::with_capacity(markdown.len());
     let mut fence = None;
     let mut code_ticks = None;
@@ -34,12 +55,7 @@ pub(crate) fn rewrite_document_links(
             continue;
         }
 
-        output.push_str(&rewrite_line(
-            line,
-            current_file,
-            content_path_by_token,
-            &mut code_ticks,
-        ));
+        output.push_str(&rewrite_line(line, current_file, &targets, &mut code_ticks));
     }
 
     output
@@ -48,7 +64,7 @@ pub(crate) fn rewrite_document_links(
 fn rewrite_line(
     line: &str,
     current_file: &str,
-    content_path_by_token: &HashMap<String, String>,
+    targets: &LinkTargets<'_>,
     code_ticks: &mut Option<usize>,
 ) -> String {
     let bytes = line.as_bytes();
@@ -92,7 +108,7 @@ fn rewrite_line(
                 index,
                 DestinationKind::Inline,
                 current_file,
-                content_path_by_token,
+                targets,
                 &mut output,
             );
             continue;
@@ -104,7 +120,7 @@ fn rewrite_line(
                 index,
                 DestinationKind::Reference,
                 current_file,
-                content_path_by_token,
+                targets,
                 &mut output,
             );
             continue;
@@ -117,8 +133,7 @@ fn rewrite_line(
             let end = index + 1 + end;
             let destination = &line[index + 1..end];
             if !destination.bytes().any(|byte| byte.is_ascii_whitespace())
-                && let Some(local) =
-                    local_destination(destination, current_file, content_path_by_token)
+                && let Some(local) = local_destination(destination, current_file, targets)
             {
                 output.push('[');
                 output.push_str(&destination.replace(']', "\\]"));
@@ -149,7 +164,7 @@ fn rewrite_destination(
     start: usize,
     kind: DestinationKind,
     current_file: &str,
-    content_path_by_token: &HashMap<String, String>,
+    targets: &LinkTargets<'_>,
     output: &mut String,
 ) -> usize {
     let Some((end, destination)) = destination_at(line, start, kind) else {
@@ -160,7 +175,7 @@ fn rewrite_destination(
         output.push_str(&line[start..start + length]);
         return start + length;
     };
-    if let Some(local) = local_destination(destination, current_file, content_path_by_token) {
+    if let Some(local) = local_destination(destination, current_file, targets) {
         output.push('<');
         output.push_str(&local);
         output.push('>');
@@ -209,10 +224,16 @@ fn destination_at(line: &str, start: usize, kind: DestinationKind) -> Option<(us
 fn local_destination(
     destination: &str,
     current_file: &str,
-    content_path_by_token: &HashMap<String, String>,
+    targets: &LinkTargets<'_>,
 ) -> Option<String> {
+    if let Some(name) = destination.strip_prefix(crate::docx::ASSET_SCHEME) {
+        return targets
+            .assets
+            .get(name)
+            .map(|target| relative_file_path(current_file, target));
+    }
     let link = destination.parse::<KnowledgeLink>().ok()?;
-    let target = content_path_by_token.get(&link.token)?;
+    let target = targets.documents.get(&link.token)?;
     let mut relative = relative_file_path(current_file, target);
     relative = relative.replace('%', "%25").replace('#', "%23");
     if let Some(fragment) = link.url.fragment().filter(|fragment| !fragment.is_empty()) {

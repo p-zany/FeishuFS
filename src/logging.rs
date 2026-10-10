@@ -45,7 +45,7 @@ pub fn init(verbose: u8, log_file: Option<&Path>) -> Option<PathBuf> {
         Ok(file) => Some((absolute(path), file)),
         Err(error) => {
             eprintln!(
-                "警告：无法打开日志文件 {}：{error}；本次只输出到终端",
+                "Warning: failed to open log file {}: {error}; using console output only",
                 path.display()
             );
             None
@@ -55,7 +55,7 @@ pub fn init(verbose: u8, log_file: Option<&Path>) -> Option<PathBuf> {
     let subscriber = tracing_subscriber::registry().with(console);
     let Some((path, file)) = file else {
         if subscriber.try_init().is_err() {
-            eprintln!("警告：日志订阅器已被初始化，沿用现有设置");
+            eprintln!("Warning: logging is already initialized; retaining the current settings");
         }
         return None;
     };
@@ -67,9 +67,9 @@ pub fn init(verbose: u8, log_file: Option<&Path>) -> Option<PathBuf> {
         .with_writer(FileAppender::new(file))
         .with_filter(env_filter(file_level(verbose)));
     if subscriber.with(detail).try_init().is_err() {
-        eprintln!("警告：日志订阅器已被初始化，沿用现有设置");
+        eprintln!("Warning: logging is already initialized; retaining the current settings");
     }
-    info!(path = %path.display(), "详细日志写入文件");
+    info!(path = %path.display(), "Detailed logging enabled");
     Some(path)
 }
 

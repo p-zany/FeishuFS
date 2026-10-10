@@ -4,11 +4,12 @@ use std::{fs, sync::Arc, time::Duration};
 
 use anyhow::{Result, bail};
 use feishufs::{
-    ContentRequest, FeishuFs, FsOptions, KnowledgeLink, RemoteNode, RemoteSource, RemoteSpace,
+    ContentAsset, ContentBundle, ContentRequest, FeishuFs, FsOptions, KnowledgeLink, RemoteNode,
+    RemoteSource, RemoteSpace,
 };
-use fsk::{MountOptions, MountSession};
+use fsk::{Filesystem, MountOptions, MountSession};
 
-/// A fake knowledge space reached through a document link.
+/// A fake space reached through a document link.
 struct SmokeSource;
 
 impl RemoteSource for SmokeSource {
@@ -43,9 +44,25 @@ impl RemoteSource for SmokeSource {
             ContentRequest::Markdown { token, .. } if token == "obj-leaf" => {
                 Ok(b"# Leaf\n".to_vec())
             }
+            ContentRequest::Whiteboard { .. } => Ok(b"\xff\xd8\xffimage".to_vec()),
             ContentRequest::Inline { bytes } => Ok(bytes.clone()),
             _ => bail!("unexpected smoke-test content request: {request:?}"),
         }
+    }
+
+    fn fetch_bundle(&self, request: &ContentRequest) -> Result<ContentBundle> {
+        let mut bundle = ContentBundle::from(self.fetch_content(request)?);
+        if matches!(request, ContentRequest::Markdown { token, .. } if token == "obj-root") {
+            bundle.bytes.extend_from_slice(
+                b"\n```mermaid\nA --> B\n```\n\n![Board](feishufs-asset:62.jpg)\n",
+            );
+            bundle.assets.push(ContentAsset {
+                name: "62.jpg".into(),
+                request: ContentRequest::Whiteboard { token: "b".into() },
+                bytes: b"\xff\xd8\xffimage".to_vec(),
+            });
+        }
+        Ok(bundle)
     }
 }
 
@@ -87,6 +104,8 @@ fn mounts_reads_and_rejects_writes() {
         },
     )
     .unwrap();
+    let root_directory = filesystem.lookup(fsk::ROOT_INODE, b"Root").unwrap().0;
+    let root_content = filesystem.lookup(root_directory, b"index.md").unwrap().0;
     let temporary = tempfile::tempdir().unwrap();
     let mountpoint = temporary.path().join("mnt");
     fs::create_dir(&mountpoint).unwrap();
@@ -102,8 +121,13 @@ fn mounts_reads_and_rejects_writes() {
     // The mount root is the space: no index of its own, child pages as trees.
     assert_eq!(
         fs::read_to_string(mountpoint.join("Root/index.md")).unwrap(),
-        "# Root\n\nSee [leaf](<Child/Leaf.md>).\n"
+        format!(
+            "# Root\n\nSee [leaf](<Child/Leaf.md>).\n\n```mermaid\nA --> B\n```\n\n![Board](<../.feishufs-assets/{root_content}/62.jpg>)\n"
+        )
     );
+    let image_path = mountpoint.join(format!(".feishufs-assets/{root_content}/62.jpg"));
+    assert_eq!(fs::read(&image_path).unwrap(), b"\xff\xd8\xffimage");
+    assert!(fs::write(&image_path, b"changed").is_err());
     assert_eq!(
         fs::read_to_string(mountpoint.join("Root/Child/index.md")).unwrap(),
         "# Child\n"

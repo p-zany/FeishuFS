@@ -10,7 +10,6 @@ use openlark_core::{
 };
 use openlark_docs::{
     ccm::{
-        docs::v1::{GetDocsContentRequest, content::get::get_docs_content},
         drive::v1::{
             CreateExportTaskRequest, DownloadExportRequest, GetExportTaskRequest,
             file::DownloadFileRequest,
@@ -22,12 +21,16 @@ use openlark_docs::{
     },
     common::api_endpoints::WikiApiV2,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
 
 use crate::{
+    docx::{image_extension, render_document, valid_token},
     link::KnowledgeLink,
-    remote::{ContentRequest, RemoteNode, RemoteSource, RemoteSpace, SPACE_OBJECT_TYPE},
+    remote::{
+        ContentBundle, ContentRequest, RemoteNode, RemoteSource, RemoteSpace, SPACE_OBJECT_TYPE,
+    },
+    sdk_error::SdkError,
 };
 
 const EXPORT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -55,10 +58,10 @@ pub struct OpenLarkSource {
 impl OpenLarkSource {
     pub fn new(options: OpenLarkOptions) -> Result<Self> {
         if options.max_download_bytes == 0 {
-            bail!("单文件下载上限必须大于 0");
+            bail!("The per-file download limit must be greater than zero");
         }
-        let max_response_size =
-            u64::try_from(options.max_download_bytes).context("单文件下载上限超出 u64 范围")?;
+        let max_response_size = u64::try_from(options.max_download_bytes)
+            .context("The per-file download limit exceeds the u64 range")?;
         let base_config = Config::builder()
             .app_id(options.app_id)
             .app_secret(options.app_secret)
@@ -71,15 +74,15 @@ impl OpenLarkSource {
             .build();
         base_config
             .validate()
-            .map_err(|error| anyhow!(error))
-            .context("OpenLark 配置无效")?;
+            .map_err(SdkError)
+            .context("Invalid OpenLark configuration")?;
         let provider = AuthTokenProvider::new(base_config.clone());
         let config = base_config.with_token_provider(provider);
         let runtime = Builder::new_multi_thread()
             .enable_all()
             .thread_name("feishufs-api")
             .build()
-            .context("无法创建 OpenLark Tokio runtime")?;
+            .context("Failed to create the OpenLark Tokio runtime")?;
 
         Ok(Self {
             config,
@@ -101,7 +104,7 @@ impl OpenLarkSource {
     /// This bypasses `ListWikiSpaceNodesRequest` only to read `has_child`, which
     /// that model drops even though the API returns it. Knowing it lets the tree
     /// walk skip one request per childless document, which matters when a whole
-    /// knowledge space (100 requests/minute) has to be re-read every minute.
+    /// space (100 requests/minute) has to be re-read every minute.
     fn list_children_page(
         &self,
         space_id: &str,
@@ -122,15 +125,102 @@ impl OpenLarkSource {
                 request,
                 &self.config,
                 Some(self.request_option()),
-                "获取知识空间子节点列表",
+                "List space child nodes",
             ))
-            .map_err(|error| anyhow!(error))
+            .map_err(SdkError)
             .with_context(|| {
                 format!(
-                    "Wiki nodes 请求失败，space {space_id}，父节点 {}",
-                    parent_node_token.unwrap_or("（空间根）")
+                    "Wiki nodes request failed for space {space_id}, parent {}",
+                    parent_node_token.unwrap_or("(space root)")
                 )
             })
+    }
+
+    fn fetch_document(&self, token: &str, url: Option<&str>) -> Result<ContentBundle> {
+        if !valid_token(token) {
+            bail!("Invalid document token");
+        }
+        let request = ApiRequest::<DocsAiResponse>::post(format!(
+            "/open-apis/docs_ai/v1/documents/{token}/fetch"
+        ))
+        .json_body(&DocsAiRequest {
+            format: "xml",
+            extra_param: r#"{"enable_user_cite_reference_map":true,"return_html5_block_data":true}"#,
+            export_option: DocsAiExportOptions {
+                export_block_id: false,
+                export_style_attrs: false,
+                export_cite_extra_data: false,
+            },
+        });
+        let response: DocsAiResponse = self
+            .runtime
+            .block_on(Transport::request_typed(
+                request,
+                &self.config,
+                Some(self.request_option()),
+                "Fetch the Docs AI document structure",
+            ))
+            .map_err(SdkError)
+            .with_context(|| {
+                format!("Failed to fetch XML for document {token}; check document read permissions")
+            })?;
+        let origin = url
+            .and_then(|url| url.parse::<KnowledgeLink>().ok())
+            .map(|link| link.url.origin().ascii_serialization())
+            .unwrap_or_else(|| {
+                if self.config.base_url().contains("larksuite") {
+                    "https://larkoffice.com".into()
+                } else {
+                    "https://feishu.cn".into()
+                }
+            });
+        render_document(
+            &response.document.content,
+            &response.document.reference_map,
+            &origin,
+            self.max_download_bytes,
+            |token| self.download_whiteboard(token),
+        )
+    }
+
+    fn download_whiteboard(&self, token: &str) -> Result<Vec<u8>> {
+        if !valid_token(token) {
+            bail!("Invalid whiteboard token");
+        }
+        let request = ApiRequest::<Vec<u8>>::get(format!(
+            "/open-apis/board/v1/whiteboards/{token}/download_as_image"
+        ));
+        let response = self
+            .runtime
+            .block_on(Transport::request(
+                request,
+                &self.config,
+                Some(self.request_option()),
+            ))
+            .map_err(SdkError)
+            .with_context(|| {
+                format!("Failed to download whiteboard {token}; check board:whiteboard:node:read permissions")
+            })?;
+        // Raw downloads may carry an API error instead of bytes. Do not hide it
+        // behind `data: None`, nor publish its JSON as a picture.
+        if response.raw_response.code != 0 {
+            bail!(
+                "Whiteboard download API error {}: {}",
+                response.raw_response.code,
+                response.raw_response.msg
+            );
+        }
+        let bytes: Vec<u8> = response
+            .data
+            .context("Whiteboard download succeeded but returned no data")?;
+        if bytes.len() > self.max_download_bytes {
+            bail!(
+                "Whiteboard image exceeds the {} byte limit",
+                self.max_download_bytes
+            );
+        }
+        image_extension(&bytes)?;
+        Ok(bytes)
     }
 
     fn export(&self, token: &str, document_type: &str, extension: &str) -> Result<Vec<u8>> {
@@ -140,9 +230,9 @@ impl OpenLarkSource {
                 CreateExportTaskRequest::new(self.config.clone(), extension, token, document_type)
                     .execute_with_options(self.request_option()),
             )
-            .map_err(|error| anyhow!(error))
+            .map_err(SdkError)
             .with_context(|| {
-                format!("无法创建 {document_type} 文档 {token} 的 {extension} 导出任务")
+                format!("Failed to create a {extension} export task for {document_type} document {token}")
             })?;
 
         let deadline = std::time::Instant::now() + EXPORT_TIMEOUT;
@@ -155,15 +245,18 @@ impl OpenLarkSource {
                     GetExportTaskRequest::new(self.config.clone(), &created.ticket, token)
                         .execute_with_options(self.request_option()),
                 )
-                .map_err(|error| anyhow!(error))
-                .with_context(|| format!("无法查询导出任务 {}", created.ticket))?;
+                .map_err(SdkError)
+                .with_context(|| format!("Failed to query export task {}", created.ticket))?;
 
             if let Some(result) = response.result {
                 last_status = result.job_status;
                 last_message = result.job_error_msg.clone();
                 if result.job_status == Some(0) {
                     let file_token = result.file_token.with_context(|| {
-                        format!("导出任务 {} 已完成但未返回 file_token", created.ticket)
+                        format!(
+                            "Export task {} completed without a file_token",
+                            created.ticket
+                        )
                     })?;
                     let response = self
                         .runtime
@@ -172,17 +265,22 @@ impl OpenLarkSource {
                                 .max_size(self.max_download_bytes)
                                 .execute_with_options(self.request_option()),
                         )
-                        .map_err(|error| anyhow!(error))
-                        .with_context(|| format!("无法下载导出任务 {} 的产物", created.ticket))?;
-                    return response
-                        .data
-                        .with_context(|| format!("导出任务 {} 返回空文件", created.ticket));
+                        .map_err(SdkError)
+                        .with_context(|| {
+                            format!(
+                                "Failed to download the output of export task {}",
+                                created.ticket
+                            )
+                        })?;
+                    return response.data.with_context(|| {
+                        format!("Export task {} returned no data", created.ticket)
+                    });
                 }
             }
 
             if std::time::Instant::now() >= deadline {
                 bail!(
-                    "导出任务 {} 在 {} 内未完成（状态 {:?}，消息 {:?}）",
+                    "Export task {} did not complete within {} (status {:?}, message {:?})",
                     created.ticket,
                     humantime::format_duration(EXPORT_TIMEOUT),
                     last_status,
@@ -207,36 +305,46 @@ impl RemoteSource for OpenLarkSource {
                     self.request_option(),
                 ),
             )
-            .map_err(|error| anyhow!(error))
+            .map_err(SdkError)
             .context(
-                "Wiki get_node 请求失败；请确认该链接指向知识库内的文档，且应用有知识库读取权限",
+                "Wiki get_node request failed; verify the document belongs to a wiki and the application can read it",
             )?;
         let node = response
             .node
-            .context("飞书返回成功，但节点 data.node 为空")?;
+            .context("Feishu returned success without data.node")?;
         if node.space_id.trim().is_empty() {
-            bail!("飞书返回的节点缺少 space_id，无法确定要挂载的知识库");
+            bail!("The node response is missing space_id; the space cannot be selected");
         }
 
-        let name = self
-            .runtime
-            .block_on(
-                GetWikiSpaceRequest::new(self.config.clone())
-                    .space_id(node.space_id.clone())
-                    .execute_with_options(self.request_option()),
-            )
-            .map_err(|error| anyhow!(error))
-            .with_context(|| format!("无法读取知识库 {} 的空间信息", node.space_id))
-            .ok()
-            .and_then(|response| response.space)
-            .map(|space| space.name)
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| format!("知识库 {}", node.space_id));
-
         Ok(RemoteSpace {
+            name: format!("Space {}", node.space_id),
             space_id: node.space_id,
-            name,
         })
+    }
+
+    fn refresh_space(&self, space: &RemoteSpace) -> Result<RemoteSpace> {
+        let response = self.runtime.block_on(
+            GetWikiSpaceRequest::new(self.config.clone())
+                .space_id(space.space_id.clone())
+                .execute_with_options(self.request_option()),
+        );
+        match response {
+            Ok(response) => Ok(RemoteSpace {
+                space_id: space.space_id.clone(),
+                name: response
+                    .space
+                    .map(|space| space.name)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| space.name.clone()),
+            }),
+            Err(error) => {
+                crate::logging::failure(
+                    "Failed to refresh space metadata; retaining the previous title",
+                    &anyhow!(SdkError(error)),
+                );
+                Ok(space.clone())
+            }
+        }
     }
 
     fn list_children(&self, space_id: &str, parent: &RemoteNode) -> Result<Vec<RemoteNode>> {
@@ -256,10 +364,10 @@ impl RemoteSource for OpenLarkSource {
                 break;
             }
             let next = page.page_token.context(
-                "Wiki nodes 响应 has_more=true，但未返回 page_token；为避免死循环已停止",
+                "Wiki nodes response has_more=true but has no page_token; pagination stopped",
             )?;
             if page_token.as_deref() == Some(next.as_str()) {
-                bail!("Wiki nodes 分页 token 未前进；为避免死循环已停止");
+                bail!("Wiki nodes pagination token did not advance; pagination stopped");
             }
             page_token = Some(next);
         }
@@ -268,25 +376,10 @@ impl RemoteSource for OpenLarkSource {
 
     fn fetch_content(&self, request: &ContentRequest) -> Result<Vec<u8>> {
         match request {
-            ContentRequest::Markdown {
-                token,
-                document_type,
-            } => {
-                let response = self
-                    .runtime
-                    .block_on(get_docs_content(
-                        GetDocsContentRequest::new(token, document_type, "markdown"),
-                        &self.config,
-                        Some(self.request_option()),
-                    ))
-                    .map_err(|error| anyhow!(error))
-                    .with_context(|| format!("无法读取文档 {token} 的 Markdown 内容"))?;
-                let mut bytes = response.content.into_bytes();
-                if !bytes.ends_with(b"\n") {
-                    bytes.push(b'\n');
-                }
-                Ok(bytes)
+            ContentRequest::Markdown { .. } => {
+                self.fetch_bundle(request).map(|bundle| bundle.bytes)
             }
+            ContentRequest::Whiteboard { token } => self.download_whiteboard(token),
             ContentRequest::Download { token } => {
                 let response = self
                     .runtime
@@ -295,9 +388,11 @@ impl RemoteSource for OpenLarkSource {
                             .max_size(self.max_download_bytes)
                             .execute_with_options(self.request_option()),
                     )
-                    .map_err(|error| anyhow!(error))
-                    .with_context(|| format!("无法下载附件 {token}"))?;
-                response.data.context("附件下载响应为空")
+                    .map_err(SdkError)
+                    .with_context(|| format!("Failed to download attachment {token}"))?;
+                response
+                    .data
+                    .context("Attachment download returned no data")
             }
             ContentRequest::Export {
                 token,
@@ -307,9 +402,57 @@ impl RemoteSource for OpenLarkSource {
             ContentRequest::Inline { bytes } => Ok(bytes.clone()),
         }
     }
+
+    fn fetch_bundle(&self, request: &ContentRequest) -> Result<ContentBundle> {
+        match request {
+            ContentRequest::Markdown {
+                token,
+                document_type,
+                url,
+            } => {
+                if document_type != "docx" {
+                    bail!("Docs AI content fetching currently supports only docx");
+                }
+                self.fetch_document(token, url.as_deref())
+            }
+            _ => self.fetch_content(request).map(ContentBundle::from),
+        }
+    }
 }
 
-/// One page of the knowledge-space child-node list.
+#[derive(Serialize)]
+struct DocsAiRequest<'a> {
+    format: &'a str,
+    extra_param: &'a str,
+    export_option: DocsAiExportOptions,
+}
+
+#[derive(Serialize)]
+struct DocsAiExportOptions {
+    export_block_id: bool,
+    export_style_attrs: bool,
+    export_cite_extra_data: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocsAiResponse {
+    document: DocsAiDocument,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocsAiDocument {
+    content: String,
+    #[serde(default)]
+    reference_map: serde_json::Value,
+}
+
+impl ApiResponseTrait for DocsAiResponse {
+    fn data_format() -> ResponseFormat {
+        ResponseFormat::Data
+    }
+}
+
+/// One page of the space child-node list.
 #[derive(Debug, Deserialize)]
 struct WikiNodePage {
     #[serde(default)]
@@ -352,7 +495,7 @@ fn remote_node(node: WikiNode) -> RemoteNode {
         title: node
             .title
             .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| format!("未命名-{fallback}")),
+            .unwrap_or_else(|| format!("Untitled-{fallback}")),
         url: node.url,
         has_child: node.has_child,
     }

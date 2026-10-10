@@ -96,21 +96,21 @@ fn object_type_for_path(segment: &str) -> Option<Option<&'static str>> {
 
 #[derive(Debug, Error)]
 pub enum LinkError {
-    #[error("链接不是合法 URL: {0}")]
+    #[error("Invalid URL: {0}")]
     InvalidUrl(#[source] url::ParseError),
-    #[error("仅支持 http/https 链接，收到协议 {0}")]
+    #[error("Only http/https URLs are supported; received scheme {0}")]
     UnsupportedScheme(String),
-    #[error("链接缺少域名")]
+    #[error("URL has no hostname")]
     MissingHost,
-    #[error("不支持的域名 {0}；仅支持 feishu.cn、larksuite.com 和 larkoffice.com")]
+    #[error("Unsupported hostname {0}; expected feishu.cn, larksuite.com, or larkoffice.com")]
     UnsupportedHost(String),
-    #[error("链接缺少文档 token")]
+    #[error("URL has no document token")]
     MissingToken,
     #[error(
-        "不支持的飞书链接路径 {0}；支持 /wiki、/docx、/docs、/sheets、/base、/file、/mindnotes、/slides"
+        "Unsupported Feishu URL path {0}; expected /wiki, /docx, /docs, /sheets, /base, /file, /mindnotes, or /slides"
     )]
     UnsupportedPath(String),
-    #[error("文档 token 含有不支持的字符: {0}")]
+    #[error("Document token contains unsupported characters: {0}")]
     InvalidToken(String),
 }
 

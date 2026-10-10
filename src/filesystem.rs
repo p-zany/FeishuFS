@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::{
     link::KnowledgeLink,
     platform::ProjectionController,
-    remote::{ContentRequest, RemoteSource, RemoteTree},
+    remote::{ContentBundle, ContentRequest, RemoteSource, RemoteSpace, RemoteTree},
     tree::{FsState, VirtualNode, VirtualNodeKind, directory_entries, file_request},
 };
 
@@ -52,9 +52,12 @@ pub struct FeishuFs {
 struct Inner {
     source: Arc<dyn RemoteSource>,
     link: KnowledgeLink,
+    space_id: String,
     state: RwLock<FsState>,
     content: Mutex<HashMap<u64, CachedContent>>,
     fetch_gate: Mutex<()>,
+    publish_gate: Mutex<()>,
+    refresh_gate: Mutex<()>,
     cache_ttl: Duration,
     max_nodes: usize,
     projection: ProjectionController,
@@ -84,20 +87,24 @@ impl FeishuFs {
         options: FsOptions,
     ) -> Result<Self> {
         if options.cache_ttl.is_zero() {
-            bail!("cache_ttl 必须大于 0");
+            bail!("cache_ttl must be greater than zero");
         }
         if options.max_nodes == 0 {
-            bail!("max_nodes 必须大于 0");
+            bail!("max_nodes must be greater than zero");
         }
         let tree = RemoteTree::load(source.as_ref(), &link, options.max_nodes)?;
-        let state = FsState::from_remote(&tree, now_ns()).context("无法构建初始文件系统快照")?;
+        let state = FsState::from_remote(&tree, now_ns())
+            .context("Failed to build the initial filesystem snapshot")?;
         Ok(Self {
             inner: Arc::new(Inner {
                 source,
                 link,
+                space_id: tree.space_id,
                 state: RwLock::new(state),
                 content: Mutex::new(HashMap::new()),
                 fetch_gate: Mutex::new(()),
+                publish_gate: Mutex::new(()),
+                refresh_gate: Mutex::new(()),
                 cache_ttl: options.cache_ttl,
                 max_nodes: options.max_nodes,
                 projection: ProjectionController::new(),
@@ -106,24 +113,36 @@ impl FeishuFs {
     }
 
     pub fn refresh_now(&self) -> Result<RefreshSummary> {
-        let tree = RemoteTree::load(
+        let _refresh = self.inner.refresh_gate.lock();
+        let space = RemoteSpace {
+            space_id: self.inner.space_id.clone(),
+            name: self.root_title(),
+        };
+        let tree = RemoteTree::load_space(
             self.inner.source.as_ref(),
+            &space,
             &self.inner.link,
             self.inner.max_nodes,
         )?;
-        let (old_paths, new_paths, active_files) = {
+        // Traversal never holds a publication lock. Only complete snapshots are published.
+        let publication = self.inner.publish_gate.lock();
+        let changes = {
             let mut state = self.inner.state.write();
-            let old_paths = state.replace(&tree)?;
-            (old_paths, state.paths(), state.file_inodes())
+            state
+                .replace(&tree)?
+                .map(|old_paths| (old_paths, state.paths(), state.file_inodes()))
         };
-        let old_path_set: HashSet<_> = old_paths.iter().collect();
-        let new_path_set: HashSet<_> = new_paths.iter().collect();
-        let revision_changed = old_path_set != new_path_set;
-        self.inner
-            .content
-            .lock()
-            .retain(|inode, _| active_files.contains(inode));
-        self.inner.projection.invalidate(old_paths, new_paths);
+        let revision_changed = changes.is_some();
+        if let Some((_, _, active_files)) = &changes {
+            self.inner
+                .content
+                .lock()
+                .retain(|inode, _| active_files.contains(inode));
+        }
+        drop(publication);
+        if let Some((old_paths, new_paths, _)) = changes {
+            self.inner.projection.invalidate(old_paths, new_paths);
+        }
         Ok(RefreshSummary {
             node_count: tree.node_count(),
             revision_changed,
@@ -142,11 +161,14 @@ impl FeishuFs {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => match filesystem.refresh_now() {
                             Ok(summary) => {
-                                info!(nodes = summary.node_count, "知识库目录快照刷新完成")
+                                info!(
+                                    nodes = summary.node_count,
+                                    "Space directory snapshot updated"
+                                )
                             }
                             Err(error) => {
                                 crate::logging::failure(
-                                    "知识库目录刷新失败，继续使用旧快照",
+                                    "Directory refresh failed; retaining the previous snapshot",
                                     &error,
                                 );
                             }
@@ -154,7 +176,7 @@ impl FeishuFs {
                     }
                 }
             })
-            .expect("failed to spawn refresh thread");
+            .expect("Failed to spawn the directory refresh thread");
         RefreshHandle {
             stop_tx: Some(stop_tx),
             join: Some(join),
@@ -198,82 +220,184 @@ impl FeishuFs {
             .ok_or(NOT_FOUND)
     }
 
+    fn cached_content(
+        &self,
+        inode: u64,
+        refresh_if_expired: bool,
+    ) -> Result<Option<CachedContent>, FsError> {
+        let _publication = self.inner.publish_gate.lock();
+        let node = self.node(inode)?;
+        let request = file_request(&node).map_err(|_| IS_DIRECTORY)?;
+        let existing = self
+            .inner
+            .content
+            .lock()
+            .get(&inode)
+            .cloned()
+            .filter(|cached| &cached.request == request);
+        let existing = existing.map(|cached| {
+            let rendered = self.rerender_if_needed(inode, cached);
+            self.inner.content.lock().insert(inode, rendered.clone());
+            rendered
+        });
+        if let Some(cached) = existing {
+            if !refresh_if_expired
+                || request.is_inline()
+                || cached.fetched_at.elapsed() < self.inner.cache_ttl
+            {
+                return Ok(Some(cached));
+            }
+        }
+        Ok(None)
+    }
+
     fn ensure_content(
         &self,
         inode: u64,
         refresh_if_expired: bool,
     ) -> Result<CachedContent, FsError> {
-        let _gate = self.inner.fetch_gate.lock();
-        let node = self.node(inode)?;
-        let request = file_request(&node).map_err(|_| IS_DIRECTORY)?.clone();
-
-        let existing = self.inner.content.lock().get(&inode).cloned();
-        let existing = existing.map(|cached| {
-            if cached.request == request {
-                let cached = self.rerender_if_needed(inode, cached);
-                self.inner.content.lock().insert(inode, cached.clone());
-                cached
-            } else {
-                cached
+        loop {
+            if let Some(cached) = self.cached_content(inode, refresh_if_expired)? {
+                return Ok(cached);
             }
-        });
-        if let Some(cached) = &existing
-            && cached.request == request
-            && (!refresh_if_expired
-                || request.is_inline()
-                || cached.fetched_at.elapsed() < self.inner.cache_ttl)
-        {
-            return Ok(cached.clone());
-        }
+            let fetching = self.inner.fetch_gate.lock();
+            // Another reader may have completed the fetch while this one waited.
+            if let Some(cached) = self.cached_content(inode, refresh_if_expired)? {
+                return Ok(cached);
+            }
+            let node = self.node(inode)?;
+            let request = file_request(&node).map_err(|_| IS_DIRECTORY)?.clone();
+            let fetched = self.inner.source.fetch_bundle(&request);
 
-        match self.inner.source.fetch_content(&request) {
-            Ok(source) => {
-                let source_bytes: Arc<[u8]> = Arc::from(source);
-                let (bytes, tree_revision) =
-                    self.render_source(inode, &request, source_bytes.clone());
-                let unchanged = existing.as_ref().is_some_and(|cached| {
-                    cached.request == request && cached.bytes.as_ref() == bytes.as_ref()
-                });
-                let generation = existing.as_ref().map_or(1, |cached| {
-                    if unchanged {
-                        cached.generation
+            let publication = self.inner.publish_gate.lock();
+            let current = self.node(inode)?;
+            if file_request(&current).map_err(|_| IS_DIRECTORY)? != &request {
+                // The response belongs to an obsolete identity. Discard it and retry.
+                continue;
+            }
+            let existing = self.inner.content.lock().get(&inode).cloned();
+            let fetched = fetched.and_then(|bundle| {
+                let paths = self.publish_assets(inode, &request, &bundle)?;
+                Ok((bundle.bytes, paths))
+            });
+            match fetched {
+                Ok((source, asset_paths)) => {
+                    let source_bytes: Arc<[u8]> = Arc::from(source);
+                    let (bytes, tree_revision) =
+                        self.render_source(inode, &request, source_bytes.clone());
+                    let unchanged = existing.as_ref().is_some_and(|cached| {
+                        cached.request == request && cached.bytes.as_ref() == bytes.as_ref()
+                    });
+                    let generation = existing.as_ref().map_or(1, |cached| {
+                        if unchanged {
+                            cached.generation
+                        } else {
+                            cached.generation.saturating_add(1)
+                        }
+                    });
+                    let modified_ns = if unchanged {
+                        existing
+                            .as_ref()
+                            .map_or_else(now_ns, |cached| cached.modified_ns)
                     } else {
-                        cached.generation.saturating_add(1)
+                        now_ns()
+                    };
+                    let cached = CachedContent {
+                        request,
+                        source_bytes,
+                        bytes,
+                        fetched_at: Instant::now(),
+                        modified_ns,
+                        generation,
+                        tree_revision,
+                    };
+                    self.inner.content.lock().insert(inode, cached.clone());
+                    drop(publication);
+                    drop(fetching);
+                    if let Some((old_paths, new_paths)) = asset_paths {
+                        self.inner.projection.invalidate(old_paths, new_paths);
                     }
-                });
-                let modified_ns = if unchanged {
-                    existing
-                        .as_ref()
-                        .map_or_else(now_ns, |cached| cached.modified_ns)
+                    return Ok(cached);
+                }
+                Err(error) => {
+                    drop(publication);
+                    drop(fetching);
+                    if let Some(cached) = existing.filter(|cached| cached.request == request) {
+                        crate::logging::node_failure(
+                            inode,
+                            "Content refresh failed; serving the last successful cache",
+                            &error,
+                        );
+                        return Ok(cached);
+                    }
+                    crate::logging::node_failure(inode, "Initial content fetch failed", &error);
+                    return Err(FsError::IO);
+                }
+            }
+        }
+    }
+
+    fn publish_assets(
+        &self,
+        owner: u64,
+        request: &ContentRequest,
+        bundle: &ContentBundle,
+    ) -> Result<Option<(Vec<String>, Vec<String>)>> {
+        if !request.is_markdown() && bundle.assets.is_empty() {
+            return Ok(None);
+        }
+        for asset in &bundle.assets {
+            let extension = crate::docx::image_extension(&asset.bytes)?;
+            if asset.name.rsplit_once('.').map(|(_, value)| value) != Some(extension) {
+                bail!(
+                    "Asset image format does not match its filename: {}",
+                    asset.name
+                );
+            }
+        }
+        let specs = bundle
+            .assets
+            .iter()
+            .map(|asset| (asset.name.clone(), asset.request.clone()))
+            .collect();
+        let mut state = self.inner.state.write();
+        let old_paths = state.asset_paths();
+        let changed = state.set_assets(owner, request, specs)?;
+        let files = state.asset_files(owner);
+        let active = state.file_inodes();
+        let mut content = self.inner.content.lock();
+        content.retain(|inode, _| active.contains(inode));
+        for asset in &bundle.assets {
+            let inode = files[&asset.name];
+            let previous = content.get(&inode);
+            let unchanged = previous.is_some_and(|cached| {
+                cached.request == asset.request && cached.bytes.as_ref() == asset.bytes
+            });
+            let generation = previous.map_or(1, |cached| {
+                if unchanged {
+                    cached.generation
                 } else {
-                    now_ns()
-                };
-                let cached = CachedContent {
-                    request,
-                    source_bytes,
+                    cached.generation.saturating_add(1)
+                }
+            });
+            let modified_ns = previous
+                .filter(|_| unchanged)
+                .map_or_else(now_ns, |cached| cached.modified_ns);
+            let bytes: Arc<[u8]> = Arc::from(asset.bytes.clone());
+            content.insert(
+                inode,
+                CachedContent {
+                    request: asset.request.clone(),
+                    source_bytes: bytes.clone(),
                     bytes,
                     fetched_at: Instant::now(),
                     modified_ns,
                     generation,
-                    tree_revision,
-                };
-                self.inner.content.lock().insert(inode, cached.clone());
-                Ok(cached)
-            }
-            Err(error) => {
-                if let Some(cached) = existing.filter(|cached| cached.request == request) {
-                    crate::logging::node_failure(
-                        inode,
-                        "内容刷新失败，继续提供最后一次成功缓存",
-                        &error,
-                    );
-                    Ok(cached)
-                } else {
-                    crate::logging::node_failure(inode, "内容首次获取失败", &error);
-                    Err(FsError::IO)
-                }
-            }
+                    tree_revision: state.revision(),
+                },
+            );
         }
+        Ok(changed.then(|| (old_paths, state.asset_paths())))
     }
 
     fn render_source(
@@ -335,7 +459,7 @@ impl Drop for RefreshHandle {
         if let Some(join) = self.join.take()
             && join.join().is_err()
         {
-            warn!("知识库刷新线程在退出时发生 panic");
+            warn!("A refresh worker panicked during shutdown");
         }
     }
 }
@@ -766,6 +890,192 @@ mod tests {
         );
     }
 
+    fn picture_bundle() -> ContentBundle {
+        ContentBundle {
+            bytes: "# Guide\n\n![Whiteboard](feishufs-asset:62.jpg)\n"
+                .as_bytes()
+                .to_vec(),
+            assets: vec![crate::remote::ContentAsset {
+                name: "62.jpg".into(),
+                request: ContentRequest::Whiteboard { token: "b".into() },
+                bytes: b"\xff\xd8\xffimage".to_vec(),
+            }],
+        }
+    }
+
+    fn read_all(filesystem: &FeishuFs, inode: u64) -> Vec<u8> {
+        let mut bytes = vec![0; 4096];
+        let count = filesystem.read(inode, 0, &mut bytes).unwrap();
+        bytes.truncate(count);
+        bytes
+    }
+
+    fn asset_inode(filesystem: &FeishuFs, owner: u64) -> u64 {
+        let root = filesystem
+            .lookup(ROOT_INODE, b".feishufs-assets")
+            .unwrap()
+            .0;
+        let directory = filesystem
+            .lookup(root, owner.to_string().as_bytes())
+            .unwrap()
+            .0;
+        filesystem.lookup(directory, b"62.jpg").unwrap().0
+    }
+
+    #[test]
+    fn publishes_images_inside_the_read_only_mount_without_changing_leaf_layout() {
+        let (filesystem, source) = test_fs(Duration::from_secs(60));
+        source
+            .bundles
+            .lock()
+            .insert("obj-one".into(), picture_bundle());
+        assert!(filesystem.lookup(ROOT_INODE, b".feishufs-assets").is_err());
+        let owner = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap().0;
+        let body = String::from_utf8(read_all(&filesystem, owner)).unwrap();
+        assert!(body.contains(&format!("![Whiteboard](<.feishufs-assets/{owner}/62.jpg>)")));
+        let image = asset_inode(&filesystem, owner);
+        assert_eq!(read_all(&filesystem, image), b"\xff\xd8\xffimage");
+        assert_eq!(filesystem.metadata(image).unwrap().mode, 0o444);
+        assert_eq!(filesystem.write(image, 0, b"no"), Err(ACCESS_DENIED));
+        assert!(filesystem.open_file(image, true).is_err());
+        assert_eq!(filesystem.node_count(), 1);
+    }
+
+    #[test]
+    fn asset_inodes_survive_rename_move_and_leaf_to_branch_transition() {
+        let (filesystem, source) = test_fs(Duration::from_secs(3600));
+        source
+            .bundles
+            .lock()
+            .insert("obj-one".into(), picture_bundle());
+        let owner = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap().0;
+        read_all(&filesystem, owner);
+        let image = asset_inode(&filesystem, owner);
+        source
+            .children
+            .lock()
+            .insert("space-1".into(), vec![node("one", "Renamed", "docx")]);
+        source
+            .children
+            .lock()
+            .insert("one".into(), vec![leaf("child", "Child", "docx")]);
+        filesystem.refresh_now().unwrap();
+        let directory = filesystem.lookup(ROOT_INODE, b"Renamed").unwrap().0;
+        assert_eq!(filesystem.lookup(directory, b"index.md").unwrap().0, owner);
+        assert_eq!(asset_inode(&filesystem, owner), image);
+        assert!(
+            String::from_utf8(read_all(&filesystem, owner))
+                .unwrap()
+                .contains(&format!("<../.feishufs-assets/{owner}/62.jpg>"))
+        );
+        assert_eq!(source.fetches.lock().len(), 1);
+        source
+            .children
+            .lock()
+            .insert("space-1".into(), vec![node("parent", "Parent", "docx")]);
+        source
+            .children
+            .lock()
+            .insert("parent".into(), vec![leaf("one", "Renamed", "docx")]);
+        filesystem.refresh_now().unwrap();
+        let parent = filesystem.lookup(ROOT_INODE, b"Parent").unwrap().0;
+        assert_eq!(filesystem.lookup(parent, b"Renamed.md").unwrap().0, owner);
+        assert_eq!(asset_inode(&filesystem, owner), image);
+        assert!(
+            String::from_utf8(read_all(&filesystem, owner))
+                .unwrap()
+                .contains("<../.feishufs-assets/")
+        );
+    }
+
+    #[test]
+    fn refreshed_mermaid_body_removes_obsolete_images_but_never_reuses_inodes() {
+        let (filesystem, source) = test_fs(Duration::from_millis(1));
+        source
+            .bundles
+            .lock()
+            .insert("obj-one".into(), picture_bundle());
+        let owner = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap().0;
+        read_all(&filesystem, owner);
+        let image = asset_inode(&filesystem, owner);
+        source.bundles.lock().insert(
+            "obj-one".into(),
+            b"```mermaid\nA --> B\n```\n".to_vec().into(),
+        );
+        thread::sleep(Duration::from_millis(3));
+        filesystem.open_file(owner, false).unwrap();
+        assert!(filesystem.lookup(ROOT_INODE, b".feishufs-assets").is_err());
+        assert!(filesystem.metadata(image).is_err());
+        source
+            .bundles
+            .lock()
+            .insert("obj-one".into(), picture_bundle());
+        thread::sleep(Duration::from_millis(3));
+        filesystem.open_file(owner, false).unwrap();
+        assert_eq!(asset_inode(&filesystem, owner), image);
+    }
+
+    #[test]
+    fn removing_a_document_or_changing_its_identity_removes_its_assets() {
+        let (filesystem, source) = test_fs(Duration::from_secs(60));
+        source
+            .bundles
+            .lock()
+            .insert("obj-one".into(), picture_bundle());
+        let owner = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap().0;
+        read_all(&filesystem, owner);
+        let mut changed = leaf("one", "Guide", "docx");
+        changed.object_token = Some("different-object".into());
+        source
+            .children
+            .lock()
+            .insert("space-1".into(), vec![changed]);
+        filesystem.refresh_now().unwrap();
+        assert!(filesystem.lookup(ROOT_INODE, b".feishufs-assets").is_err());
+        source.children.lock().insert("space-1".into(), vec![]);
+        filesystem.refresh_now().unwrap();
+        assert!(filesystem.lookup(ROOT_INODE, b"Guide.md").is_err());
+    }
+
+    #[test]
+    fn reopening_an_image_refreshes_its_bytes() {
+        let (filesystem, source) = test_fs(Duration::from_millis(1));
+        source
+            .bundles
+            .lock()
+            .insert("obj-one".into(), picture_bundle());
+        let owner = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap().0;
+        read_all(&filesystem, owner);
+        let image = asset_inode(&filesystem, owner);
+        source
+            .content
+            .lock()
+            .insert("b".into(), Ok(b"\xff\xd8\xffupdated".to_vec()));
+        thread::sleep(Duration::from_millis(3));
+        filesystem.open_file(image, false).unwrap();
+        assert_eq!(read_all(&filesystem, image), b"\xff\xd8\xffupdated");
+    }
+
+    #[test]
+    fn concurrent_first_reads_publish_only_one_bundle() {
+        let (filesystem, source) = test_fs(Duration::from_secs(60));
+        source
+            .bundles
+            .lock()
+            .insert("obj-one".into(), picture_bundle());
+        let owner = filesystem.lookup(ROOT_INODE, b"Guide.md").unwrap().0;
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let filesystem = filesystem.clone();
+                thread::spawn(move || read_all(&filesystem, owner))
+            })
+            .collect();
+        for handle in handles {
+            assert!(!handle.join().unwrap().is_empty());
+        }
+        assert_eq!(source.fetches.lock().len(), 1);
+    }
+
     #[test]
     fn directory_verifier_detects_refresh() {
         struct Sink;
@@ -775,11 +1085,15 @@ mod tests {
             }
         }
 
-        let (filesystem, _) = test_fs(Duration::from_secs(60));
+        let (filesystem, source) = test_fs(Duration::from_secs(60));
         let mut sink = Sink;
         let first = filesystem
             .read_directory(ROOT_INODE, 0, 0, &mut sink)
             .unwrap();
+        source
+            .children
+            .lock()
+            .insert("space-1".into(), vec![leaf("one", "Renamed", "docx")]);
         filesystem.refresh_now().unwrap();
         assert_eq!(
             filesystem.read_directory(ROOT_INODE, 0, first.verifier, &mut sink),

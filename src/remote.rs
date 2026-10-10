@@ -5,7 +5,7 @@ use tracing::warn;
 
 use crate::link::KnowledgeLink;
 
-/// `object_type` used for the synthetic knowledge-space root.
+/// `object_type` used for the synthetic space root.
 pub(crate) const SPACE_OBJECT_TYPE: &str = "space";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,7 +20,7 @@ pub struct RemoteNode {
     pub has_child: bool,
 }
 
-/// The knowledge space that a document link belongs to.
+/// The space that a document link belongs to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteSpace {
     pub space_id: String,
@@ -32,8 +32,13 @@ pub enum ContentRequest {
     Markdown {
         token: String,
         document_type: String,
+        /// Original tenant URL used when turning structured references into links.
+        url: Option<String>,
     },
     Download {
+        token: String,
+    },
+    Whiteboard {
         token: String,
     },
     Export {
@@ -58,17 +63,48 @@ impl ContentRequest {
     }
 }
 
+/// A successful content fetch and its associated resources. This is not a
+/// transaction/recovery contract; failure semantics remain a design placeholder.
+#[derive(Clone, Debug, Default)]
+pub struct ContentBundle {
+    pub bytes: Vec<u8>,
+    pub assets: Vec<ContentAsset>,
+}
+
+impl From<Vec<u8>> for ContentBundle {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            assets: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ContentAsset {
+    pub name: String,
+    pub request: ContentRequest,
+    pub bytes: Vec<u8>,
+}
+
 pub trait RemoteSource: Send + Sync + 'static {
-    /// Resolve the knowledge space that owns the document behind `link`.
+    /// Resolve the space that owns the document behind `link`.
     fn resolve_space(&self, link: &KnowledgeLink) -> Result<RemoteSpace>;
+    /// Refresh metadata for an already selected space, without resolving an entry link.
+    fn refresh_space(&self, space: &RemoteSpace) -> Result<RemoteSpace> {
+        Ok(space.clone())
+    }
     /// List the direct children of `parent`; implementations may skip the
     /// request when `parent.has_child` is false.
     fn list_children(&self, space_id: &str, parent: &RemoteNode) -> Result<Vec<RemoteNode>>;
     fn fetch_content(&self, request: &ContentRequest) -> Result<Vec<u8>>;
+    fn fetch_bundle(&self, request: &ContentRequest) -> Result<ContentBundle> {
+        self.fetch_content(request).map(ContentBundle::from)
+    }
 }
 
-/// A whole knowledge space, mounted as the filesystem root.
-#[derive(Clone, Debug)]
+/// A whole space, mounted as the filesystem root.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteTree {
     pub space_id: String,
     pub title: String,
@@ -80,17 +116,29 @@ pub struct RemoteTree {
 
 impl RemoteTree {
     pub fn load(source: &dyn RemoteSource, link: &KnowledgeLink, max_nodes: usize) -> Result<Self> {
-        if max_nodes == 0 {
-            bail!("max_nodes 必须大于 0");
-        }
-
         let space = source
             .resolve_space(link)
-            .with_context(|| format!("无法定位文档 {} 所属的知识库空间", link.url))?;
-        if space.space_id.trim().is_empty() {
-            bail!("知识库空间响应缺少 space_id");
-        }
+            .with_context(|| format!("Failed to resolve the space for {}", link.url))?;
+        Self::load_space(source, &space, link, max_nodes)
+    }
 
+    /// Reload the selected space. The entry URL only supplies the tenant origin.
+    pub fn load_space(
+        source: &dyn RemoteSource,
+        selected: &RemoteSpace,
+        link: &KnowledgeLink,
+        max_nodes: usize,
+    ) -> Result<Self> {
+        if max_nodes == 0 {
+            bail!("max_nodes must be greater than zero");
+        }
+        if selected.space_id.trim().is_empty() {
+            bail!("Space response is missing space_id");
+        }
+        let space = source.refresh_space(selected)?;
+        if space.space_id != selected.space_id {
+            bail!("Space metadata must not change the selected space_id");
+        }
         let mut tree = Self {
             space_id: space.space_id.clone(),
             title: space.name,
@@ -114,7 +162,9 @@ impl RemoteTree {
             let mut page = if parent.has_child {
                 source
                     .list_children(&tree.space_id, &parent)
-                    .with_context(|| format!("无法读取节点 {} 的子节点", parent.node_token))?
+                    .with_context(|| {
+                        format!("Failed to list children of node {}", parent.node_token)
+                    })?
             } else {
                 Vec::new()
             };
@@ -126,13 +176,13 @@ impl RemoteTree {
             });
 
             let mut unique_children = Vec::with_capacity(page.len());
-            for child in page {
+            for mut child in page {
                 if let Err(error) = validate_node(&child) {
                     warn!(
                         parent = %parent.node_token,
                         node = %child.node_token,
                         %error,
-                        "忽略字段不完整的知识库节点"
+                        "Ignoring an incomplete space node"
                     );
                     continue;
                 }
@@ -141,7 +191,7 @@ impl RemoteTree {
                         expected_space = %tree.space_id,
                         actual_space = %child.space_id,
                         node = %child.node_token,
-                        "忽略跨知识空间节点"
+                        "Ignoring a node from another space"
                     );
                     continue;
                 }
@@ -149,12 +199,21 @@ impl RemoteTree {
                     warn!(
                         parent = %parent.node_token,
                         node = %child.node_token,
-                        "忽略重复或循环知识库节点"
+                        "Ignoring a duplicate or cyclic space node"
                     );
                     continue;
                 }
                 if visited.len() > max_nodes {
-                    bail!("知识库节点数超过上限 {max_nodes}；可通过 --max-nodes 调高限制");
+                    bail!("Space node count exceeds limit {max_nodes}; increase --max-nodes");
+                }
+                // Node lists often omit URLs. Preserve the entry link's tenant
+                // for structured references to documents outside this mount too.
+                if child.url.as_deref().is_none_or(|url| url.trim().is_empty()) {
+                    child.url = Some(format!(
+                        "{}/wiki/{}",
+                        link.url.origin().ascii_serialization(),
+                        child.node_token
+                    ));
                 }
                 if child.has_child {
                     queue.push_back(child.clone());
@@ -198,10 +257,10 @@ impl RemoteTree {
 
 fn validate_node(node: &RemoteNode) -> Result<()> {
     if node.space_id.trim().is_empty() {
-        bail!("space_id 为空");
+        bail!("space_id is empty");
     }
     if node.node_token.trim().is_empty() {
-        bail!("node_token 为空");
+        bail!("node_token is empty");
     }
     Ok(())
 }
@@ -223,6 +282,7 @@ pub(crate) mod test_support {
         pub children: Arc<Mutex<HashMap<String, Vec<RemoteNode>>>>,
         pub content: Arc<Mutex<ContentMap>>,
         pub fetches: Arc<Mutex<Vec<String>>>,
+        pub bundles: Arc<Mutex<HashMap<String, ContentBundle>>>,
     }
 
     impl FakeSource {
@@ -259,6 +319,7 @@ pub(crate) mod test_support {
             let key = match request {
                 ContentRequest::Markdown { token, .. }
                 | ContentRequest::Download { token }
+                | ContentRequest::Whiteboard { token }
                 | ContentRequest::Export { token, .. } => token.clone(),
                 ContentRequest::Inline { bytes } => return Ok(bytes.clone()),
             };
@@ -268,6 +329,16 @@ pub(crate) mod test_support {
                 Some(Err(message)) => bail!(message),
                 None => bail!("fake content not configured for {key}"),
             }
+        }
+
+        fn fetch_bundle(&self, request: &ContentRequest) -> Result<ContentBundle> {
+            if let ContentRequest::Markdown { token, .. } = request
+                && let Some(bundle) = self.bundles.lock().get(token).cloned()
+            {
+                self.fetches.lock().push(token.clone());
+                return Ok(bundle);
+            }
+            self.fetch_content(request).map(ContentBundle::from)
         }
     }
 
@@ -281,7 +352,7 @@ pub(crate) mod test_support {
         remote_node(token, title, object_type, false)
     }
 
-    /// The synthetic knowledge-space root, which has no content of its own.
+    /// The synthetic space root, which has no content of its own.
     pub fn space_node() -> RemoteNode {
         RemoteNode {
             space_id: "space-1".into(),
@@ -373,6 +444,20 @@ mod tests {
     }
 
     #[test]
+    fn missing_node_urls_use_the_entry_links_tenant() {
+        let source = FakeSource::with_root(node("root", "Root", "docx"));
+        let mut child = leaf("a", "A", "docx");
+        child.url = None;
+        source.children.lock().insert("space-1".into(), vec![child]);
+        let entry = "https://tenant.larksuite.com/wiki/root".parse().unwrap();
+        let tree = RemoteTree::load(&source, &entry, 10).unwrap();
+        assert_eq!(
+            tree.root_nodes[0].url.as_deref(),
+            Some("https://tenant.larksuite.com/wiki/a")
+        );
+    }
+
+    #[test]
     fn rejects_trees_over_limit() {
         let source = FakeSource::with_root(node("root", "Root", "docx"));
         source.children.lock().insert(
@@ -381,6 +466,6 @@ mod tests {
         );
 
         let error = RemoteTree::load(&source, &link(), 1).unwrap_err();
-        assert!(error.to_string().contains("超过上限"));
+        assert!(error.to_string().contains("exceeds limit"));
     }
 }

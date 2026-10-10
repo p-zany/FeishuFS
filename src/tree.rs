@@ -5,11 +5,24 @@ use fsk::{FileType, ROOT_INODE};
 
 use crate::{
     link::KnowledgeLink,
-    markdown::rewrite_document_links,
+    markdown::rewrite_document_links_with_assets,
     remote::{ContentRequest, RemoteNode, RemoteTree},
 };
 
 const MAX_COMPONENT_BYTES: usize = 180;
+pub(crate) const ASSETS_DIRECTORY: &str = ".feishufs-assets";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssetSpec {
+    name: String,
+    request: ContentRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssetManifest {
+    request: ContentRequest,
+    assets: Vec<AssetSpec>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryEntry {
@@ -50,8 +63,11 @@ pub(crate) struct FsState {
     name_by_edge: HashMap<(String, String), String>,
     base_name_by_edge: HashMap<(String, String), String>,
     content_path_by_token: HashMap<String, String>,
+    assets: HashMap<u64, AssetManifest>,
+    asset_inodes: HashSet<u64>,
     next_inode: u64,
     revision: u64,
+    remote_tree: Option<RemoteTree>,
     created_ns: u64,
     pub root_title: String,
     /// Number of remote documents in the current snapshot.
@@ -66,8 +82,11 @@ impl FsState {
             name_by_edge: HashMap::new(),
             base_name_by_edge: HashMap::new(),
             content_path_by_token: HashMap::new(),
+            assets: HashMap::new(),
+            asset_inodes: HashSet::new(),
             next_inode: ROOT_INODE + 1,
             revision: 0,
+            remote_tree: None,
             created_ns,
             root_title: String::new(),
             document_count: 0,
@@ -76,7 +95,10 @@ impl FsState {
         Ok(state)
     }
 
-    pub fn replace(&mut self, tree: &RemoteTree) -> Result<Vec<String>> {
+    pub fn replace(&mut self, tree: &RemoteTree) -> Result<Option<Vec<String>>> {
+        if self.remote_tree.as_ref() == Some(tree) {
+            return Ok(None);
+        }
         self.revision = self.revision.saturating_add(1);
         self.root_title.clone_from(&tree.title);
         self.document_count = tree.node_count();
@@ -91,9 +113,15 @@ impl FsState {
             nodes: HashMap::with_capacity(tree.node_count().saturating_mul(2)),
             content_path_by_token: HashMap::with_capacity(tree.node_count().saturating_mul(2)),
         };
-        // The mount root is the knowledge space itself: a directory without content.
-        let root_entries =
-            self.place_children(tree, &tree.space_id, ROOT_INODE, "", None, &mut building)?;
+        // The mount root is the space itself: a directory without content.
+        let root_entries = self.place_children(
+            tree,
+            &tree.space_id,
+            ROOT_INODE,
+            "",
+            Some(ASSETS_DIRECTORY),
+            &mut building,
+        )?;
         building.nodes.insert(
             ROOT_INODE,
             VirtualNode {
@@ -109,7 +137,16 @@ impl FsState {
         );
         self.nodes = building.nodes;
         self.content_path_by_token = building.content_path_by_token;
-        Ok(old_paths)
+        self.asset_inodes.clear();
+        self.assets.retain(|inode, manifest| {
+            self.nodes
+                .get(inode)
+                .and_then(|node| file_request(node).ok())
+                == Some(&manifest.request)
+        });
+        self.rebuild_assets()?;
+        self.remote_tree = Some(tree.clone());
+        Ok(Some(old_paths))
     }
 
     /// Create the entries for every child of `parent_token` inside `parent_path`.
@@ -205,7 +242,7 @@ impl FsState {
         let spec = content_spec(remote);
         let request = spec
             .map(|spec| spec.request)
-            .unwrap_or_else(|| unsupported_request(remote, "节点没有可读取的 obj_token"));
+            .unwrap_or_else(|| unsupported_request(remote, "The node has no readable obj_token"));
         let inode = self.inode_for(&content_key(&remote.node_token))?;
         let path = join_path(directory, file_name);
         self.register_link_targets(building, remote, &path);
@@ -285,13 +322,194 @@ impl FsState {
         names
     }
 
+    /// Install the assets of a successfully fetched document. Failure/recovery
+    /// semantics are deliberately not defined by this happy-path prototype.
+    pub fn set_assets(
+        &mut self,
+        owner: u64,
+        request: &ContentRequest,
+        specs: Vec<(String, ContentRequest)>,
+    ) -> Result<bool> {
+        if !request.is_markdown() {
+            if specs.is_empty() {
+                return Ok(false);
+            }
+            bail!("Only Markdown files can publish associated assets");
+        }
+        let mut used = HashSet::new();
+        let mut used_tokens = HashSet::new();
+        for (name, asset_request) in &specs {
+            let valid_name = name.rsplit_once('.').is_some_and(|(stem, extension)| {
+                !stem.is_empty()
+                    && stem
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    && matches!(extension, "jpg" | "png" | "webp" | "gif")
+            });
+            if !valid_name
+                || name.len() > MAX_COMPONENT_BYTES
+                || !used.insert(fold_name(name))
+                || !matches!(asset_request, ContentRequest::Whiteboard { token } if crate::docx::valid_token(token) && used_tokens.insert(token.clone()) && name.split('.').next() == Some(token.bytes().map(|b| format!("{b:02x}")).collect::<String>().as_str()))
+            {
+                bail!("Invalid or duplicate asset name: {name}");
+            }
+        }
+        let current = self
+            .nodes
+            .get(&owner)
+            .and_then(|node| file_request(node).ok());
+        if current != Some(request) {
+            bail!("Document identity changed; stale assets cannot be published");
+        }
+        let manifest = AssetManifest {
+            request: request.clone(),
+            assets: specs
+                .into_iter()
+                .map(|(name, request)| AssetSpec { name, request })
+                .collect(),
+        };
+        if self.assets.get(&owner) == Some(&manifest)
+            || (manifest.assets.is_empty() && !self.assets.contains_key(&owner))
+        {
+            return Ok(false);
+        }
+        if manifest.assets.is_empty() {
+            self.assets.remove(&owner);
+        } else {
+            self.assets.insert(owner, manifest);
+        }
+        self.revision = self.revision.saturating_add(1);
+        self.rebuild_assets()?;
+        Ok(true)
+    }
+
+    fn rebuild_assets(&mut self) -> Result<()> {
+        self.nodes
+            .retain(|inode, _| !self.asset_inodes.contains(inode));
+        self.asset_inodes.clear();
+        if let Some(root) = self.nodes.get_mut(&ROOT_INODE)
+            && let VirtualNodeKind::Directory { entries } = &mut root.kind
+        {
+            entries.retain(|entry| entry.name != ASSETS_DIRECTORY.as_bytes());
+            root.generation = self.revision;
+        }
+        if self.assets.is_empty() {
+            return Ok(());
+        }
+        let root = self.inode_for("assets:root")?;
+        let mut owners: Vec<_> = self.assets.keys().copied().collect();
+        owners.sort_unstable();
+        let mut root_entries = Vec::new();
+        for owner in owners {
+            let directory = self.inode_for(&format!("assets:directory:{owner}"))?;
+            let path = format!("{ASSETS_DIRECTORY}/{owner}");
+            let mut entries = Vec::new();
+            for spec in self.assets[&owner].assets.clone() {
+                let ContentRequest::Whiteboard { token } = &spec.request else {
+                    unreachable!("validated asset request");
+                };
+                let inode = self.inode_for(&format!("assets:file:{owner}:{token}"))?;
+                entries.push(DirectoryEntry {
+                    name: spec.name.as_bytes().to_vec(),
+                    inode,
+                    kind: FileType::File,
+                });
+                self.nodes.insert(
+                    inode,
+                    VirtualNode {
+                        inode,
+                        parent: directory,
+                        path: join_path(&path, &spec.name),
+                        generation: self.revision,
+                        created_ns: self.created_ns,
+                        kind: VirtualNodeKind::File {
+                            request: spec.request,
+                        },
+                    },
+                );
+                self.asset_inodes.insert(inode);
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            self.nodes.insert(
+                directory,
+                VirtualNode {
+                    inode: directory,
+                    parent: root,
+                    path,
+                    generation: self.revision,
+                    created_ns: self.created_ns,
+                    kind: VirtualNodeKind::Directory { entries },
+                },
+            );
+            self.asset_inodes.insert(directory);
+            root_entries.push(DirectoryEntry {
+                name: owner.to_string().into_bytes(),
+                inode: directory,
+                kind: FileType::Directory,
+            });
+        }
+        root_entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self.nodes.insert(
+            root,
+            VirtualNode {
+                inode: root,
+                parent: ROOT_INODE,
+                path: ASSETS_DIRECTORY.into(),
+                generation: self.revision,
+                created_ns: self.created_ns,
+                kind: VirtualNodeKind::Directory {
+                    entries: root_entries,
+                },
+            },
+        );
+        self.asset_inodes.insert(root);
+        if let VirtualNodeKind::Directory { entries } =
+            &mut self.nodes.get_mut(&ROOT_INODE).expect("root").kind
+        {
+            entries.push(DirectoryEntry {
+                name: ASSETS_DIRECTORY.as_bytes().to_vec(),
+                inode: root,
+                kind: FileType::Directory,
+            });
+            entries.sort_by(|a, b| fold_name_bytes(&a.name).cmp(&fold_name_bytes(&b.name)));
+        }
+        Ok(())
+    }
+
+    pub fn asset_paths(&self) -> Vec<String> {
+        self.asset_inodes
+            .iter()
+            .filter_map(|inode| self.nodes.get(inode).map(|node| node.path.clone()))
+            .collect()
+    }
+
+    pub fn asset_files(&self, owner: u64) -> HashMap<String, u64> {
+        self.assets
+            .get(&owner)
+            .map(|manifest| {
+                manifest
+                    .assets
+                    .iter()
+                    .filter_map(|spec| {
+                        let ContentRequest::Whiteboard { token } = &spec.request else {
+                            return None;
+                        };
+                        self.inode_by_key
+                            .get(&format!("assets:file:{owner}:{token}"))
+                            .map(|inode| (spec.name.clone(), *inode))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn inode_for(&mut self, key: &str) -> Result<u64> {
         if let Some(inode) = self.inode_by_key.get(key) {
             return Ok(*inode);
         }
         let inode = self.next_inode;
         if inode == u64::MAX {
-            bail!("inode 空间已耗尽");
+            bail!("Inode space exhausted");
         }
         self.next_inode += 1;
         self.inode_by_key.insert(key.to_owned(), inode);
@@ -338,7 +556,20 @@ impl FsState {
         let Ok(markdown) = std::str::from_utf8(source) else {
             return source.to_vec();
         };
-        rewrite_document_links(markdown, &node.path, &self.content_path_by_token).into_bytes()
+        let asset_paths = self
+            .asset_files(inode)
+            .into_iter()
+            .filter_map(|(name, inode)| {
+                self.nodes.get(&inode).map(|node| (name, node.path.clone()))
+            })
+            .collect();
+        rewrite_document_links_with_assets(
+            markdown,
+            &node.path,
+            &self.content_path_by_token,
+            &asset_paths,
+        )
+        .into_bytes()
     }
 }
 
@@ -380,14 +611,14 @@ pub struct ContentSpec {
 }
 
 /// Content of a node, or `None` for nodes that have no document at all
-/// (currently only the knowledge-space root).
+/// (currently only the space root).
 #[must_use]
 pub fn content_spec(node: &RemoteNode) -> Option<ContentSpec> {
     if node.object_type.as_deref() == Some(crate::remote::SPACE_OBJECT_TYPE) {
         return None;
     }
     let Some(token) = node.object_token.as_ref().filter(|token| !token.is_empty()) else {
-        return Some(unsupported_spec(node, "节点没有可读取的 obj_token"));
+        return Some(unsupported_spec(node, "The node has no readable obj_token"));
     };
     let kind = node.object_type.as_deref().map(str::to_ascii_lowercase);
     match kind.as_deref() {
@@ -396,6 +627,7 @@ pub fn content_spec(node: &RemoteNode) -> Option<ContentSpec> {
             request: ContentRequest::Markdown {
                 token: token.clone(),
                 document_type: "docx".into(),
+                url: node.url.clone(),
             },
         }),
         Some("doc") => Some(ContentSpec {
@@ -420,8 +652,11 @@ pub fn content_spec(node: &RemoteNode) -> Option<ContentSpec> {
                 token: token.clone(),
             },
         }),
-        Some(kind) => Some(unsupported_spec(node, &format!("暂不支持对象类型 {kind}"))),
-        None => Some(unsupported_spec(node, "节点没有 obj_type")),
+        Some(kind) => Some(unsupported_spec(
+            node,
+            &format!("Unsupported object type: {kind}"),
+        )),
+        None => Some(unsupported_spec(node, "The node has no obj_type")),
     }
 }
 
@@ -454,9 +689,9 @@ fn unsupported_spec(node: &RemoteNode, reason: &str) -> ContentSpec {
 
 fn unsupported_request(node: &RemoteNode, reason: &str) -> ContentRequest {
     let object_type = node.object_type.as_deref().unwrap_or("unknown");
-    let url = node.url.as_deref().unwrap_or("（飞书未返回链接）");
+    let url = node.url.as_deref().unwrap_or("(Feishu returned no URL)");
     let markdown = format!(
-        "# {}\n\n> FeishuFS 未能导出此节点。\n\n- 原因：{}\n- 对象类型：`{}`\n- 云端链接：{}\n",
+        "# {}\n\n> FeishuFS could not export this node.\n\n- Reason: {}\n- Object type: `{}`\n- Cloud URL: {}\n",
         node.title, reason, object_type, url
     );
     ContentRequest::Inline {
@@ -496,7 +731,7 @@ pub fn sanitize_component(title: &str) -> String {
     }
     let trimmed = output.trim().trim_end_matches([' ', '.']);
     let mut output = if trimmed.is_empty() {
-        "未命名".to_owned()
+        "Untitled".to_owned()
     } else {
         trimmed.to_owned()
     };
@@ -507,7 +742,7 @@ pub fn sanitize_component(title: &str) -> String {
     }
     truncate_utf8(&mut output, MAX_COMPONENT_BYTES);
     if output.is_empty() {
-        "未命名".to_owned()
+        "Untitled".to_owned()
     } else {
         output
     }
@@ -600,7 +835,7 @@ pub(crate) fn file_request(node: &VirtualNode) -> Result<&ContentRequest> {
     match &node.kind {
         VirtualNodeKind::File { request } => Ok(request),
         VirtualNodeKind::Directory { .. } => {
-            anyhow::bail!("inode {} 是目录而不是文件", node.inode)
+            anyhow::bail!("Inode {} is a directory, not a file", node.inode)
         }
     }
 }
@@ -609,7 +844,7 @@ pub(crate) fn directory_entries(node: &VirtualNode) -> Result<&[DirectoryEntry]>
     match &node.kind {
         VirtualNodeKind::Directory { entries } => Ok(entries),
         VirtualNodeKind::File { .. } => {
-            anyhow::bail!("inode {} 是文件而不是目录", node.inode)
+            anyhow::bail!("Inode {} is a file, not a directory", node.inode)
         }
     }
 }
@@ -649,7 +884,7 @@ mod tests {
         assert_eq!(sanitize_component("CON"), "CON_");
         assert_eq!(sanitize_component("lpt9.txt"), "lpt9_.txt");
         assert_eq!(sanitize_component("CON.md"), "CON_.md");
-        assert_eq!(sanitize_component("..."), "未命名");
+        assert_eq!(sanitize_component("..."), "Untitled");
     }
 
     #[test]
@@ -670,6 +905,7 @@ mod tests {
                 request: ContentRequest::Markdown {
                     token: "obj-doc".into(),
                     document_type: "docx".into(),
+                    url: doc.url.clone(),
                 },
             })
         );
@@ -815,6 +1051,66 @@ mod tests {
     }
 
     #[test]
+    fn asset_namespace_is_reserved_without_shadowing_a_remote_directory() {
+        let tree = wiki_tree(
+            vec![
+                leaf("doc", "Doc", "docx"),
+                node("reserved", ASSETS_DIRECTORY, "docx"),
+            ],
+            HashMap::from([("reserved".into(), vec![leaf("kid", "Kid", "docx")])]),
+        );
+        let mut state = FsState::from_remote(&tree, 1).unwrap();
+        assert!(names_of(&state, ROOT_INODE).contains(&format!("{ASSETS_DIRECTORY}~reserved")));
+        let owner = state
+            .nodes
+            .values()
+            .find(|node| node.path == "Doc.md")
+            .unwrap()
+            .inode;
+        let request = file_request(&state.nodes[&owner]).unwrap().clone();
+        let specs = vec![(
+            "62.jpg".into(),
+            ContentRequest::Whiteboard { token: "b".into() },
+        )];
+        state.set_assets(owner, &request, specs).unwrap();
+        let names = names_of(&state, ROOT_INODE);
+        assert!(names.contains(&ASSETS_DIRECTORY.to_owned()));
+        assert!(names.contains(&format!("{ASSETS_DIRECTORY}~reserved")));
+        let before = state.paths();
+        assert!(
+            state
+                .set_assets(
+                    owner,
+                    &request,
+                    vec![(
+                        "../escape.jpg".into(),
+                        ContentRequest::Whiteboard { token: "b".into() }
+                    )]
+                )
+                .is_err()
+        );
+        assert_eq!(before, state.paths());
+        assert!(
+            state
+                .set_assets(
+                    owner,
+                    &request,
+                    vec![
+                        (
+                            "62.jpg".into(),
+                            ContentRequest::Whiteboard { token: "b".into() }
+                        ),
+                        (
+                            "62.png".into(),
+                            ContentRequest::Whiteboard { token: "b".into() }
+                        )
+                    ]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn links_are_rewritten_to_leaf_and_index_paths() {
         let branch = node("branch", "指南", "docx");
         let tree = wiki_tree(
@@ -833,7 +1129,7 @@ mod tests {
                     .find(|entry| entry.name == b"index.md")
             })
             .map(|entry| entry.inode)
-            .expect("指南/index.md should exist");
+            .expect("The branch index.md should exist");
 
         let branch_request = file_request(&state.nodes[&index]).unwrap().clone();
         let source = concat!(

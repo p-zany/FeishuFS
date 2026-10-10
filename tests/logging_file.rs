@@ -37,7 +37,9 @@ impl RemoteSource for FailingSource {
     fn fetch_content(&self, request: &ContentRequest) -> Result<Vec<u8>> {
         match request {
             ContentRequest::Inline { bytes } => Ok(bytes.clone()),
-            _ => bail!("API错误 131006 response: permission denied, tenant needs read permission."),
+            _ => {
+                bail!("API error 131006 response: permission denied, tenant needs read permission.")
+            }
         }
     }
 }
@@ -74,7 +76,7 @@ fn log_file_records_the_feishu_error_chain() {
 
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(
-        log.contains("内容首次获取失败"),
+        log.contains("Initial content fetch failed"),
         "the concise line must be present:\n{log}"
     );
     assert!(
