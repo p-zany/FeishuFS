@@ -51,58 +51,39 @@ jobs:
       - name: Run Nix/workflow checks, Linux hooks and normal Rust tests (no live APIs or mounts)
         shell: devenv shell -- bash -e {0}
         run: devenv test
-      - name: Build, validate and package Linux and Windows binaries
+      - name: Build, validate and package the Linux binary
         shell: devenv shell -- bash -e {0}
         run: |
           set -uo pipefail
           export LC_ALL=C
-          outputs=$(devenv build outputs.feishufsLinux outputs.feishufsWindows)
+          outputs=$(devenv build outputs.feishufsLinux)
           linux=$(jq -er '."outputs.feishufsLinux"' <<< "$outputs")
-          windows=$(jq -er '."outputs.feishufsWindows"' <<< "$outputs")
           version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "feishufs") | .version')
           test "$("$linux/bin/feishufs" --version)" = "feishufs $version"
           "$linux/bin/feishufs" --help
           "$linux/bin/feishufs" inspect --help
           "$linux/bin/feishufs" mount --help
-          # Reject ELF interpreters/shared libraries and dynamic VC++ runtimes.
+          # Reject ELF interpreters/shared libraries.
           readelf -l "$linux/bin/feishufs" > "$RUNNER_TEMP/feishufs-elf-headers.txt"
           readelf -d "$linux/bin/feishufs" > "$RUNNER_TEMP/feishufs-elf-dynamic.txt"
           if grep -q INTERP "$RUNNER_TEMP/feishufs-elf-headers.txt" || grep -q NEEDED "$RUNNER_TEMP/feishufs-elf-dynamic.txt"; then
             echo "Linux binary must be statically linked" >&2
             exit 1
           fi
-          llvm-readobj --file-headers --coff-imports "$windows/bin/feishufs.exe" > "$RUNNER_TEMP/feishufs-pe.txt"
-          grep -q 'Format: COFF-x86-64' "$RUNNER_TEMP/feishufs-pe.txt"
-          if grep -Ei 'Name: (vcruntime|msvcp|ucrtbase|api-ms-win-crt)' "$RUNNER_TEMP/feishufs-pe.txt"; then
-            echo "Windows binary must use a static CRT" >&2
-            exit 1
-          fi
           # Package only public release files; Nix outputs remain binary-only.
           assets="$PWD/.cache/release"
           linux_bundle=$(mktemp -d "$RUNNER_TEMP/feishufs-linux.XXXXXX")
-          windows_bundle=$(mktemp -d "$RUNNER_TEMP/feishufs-windows.XXXXXX")
           linux_archive="feishufs-v$version-x86_64-unknown-linux-musl.tar.gz"
-          windows_archive="feishufs-v$version-x86_64-pc-windows-msvc.zip"
           mkdir -p "$assets"
           install -m755 "$linux/bin/feishufs" "$linux_bundle/feishufs"
           install -m644 LICENSE .env.example "$linux_bundle/"
           tar -C "$linux_bundle" --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
             -cf - feishufs LICENSE .env.example | gzip -n > "$assets/$linux_archive"
           diff -u <(printf '%s\n' .env.example LICENSE feishufs) <(tar -tzf "$assets/$linux_archive" | sort)
-          install -m755 "$windows/bin/feishufs.exe" "$windows_bundle/feishufs.exe"
-          install -m644 LICENSE .env.example "$windows_bundle/"
-          (
-            cd "$windows_bundle"
-            touch -t 198001010000 feishufs.exe LICENSE .env.example
-            zip -X "$assets/$windows_archive" feishufs.exe LICENSE .env.example
-          )
-          unzip -t "$assets/$windows_archive"
-          diff -u <(printf '%s\n' .env.example LICENSE feishufs.exe) <(unzip -Z1 "$assets/$windows_archive" | sort)
           (
             cd "$assets"
             sha256sum "$linux_archive" > "$linux_archive.sha256"
-            sha256sum "$windows_archive" > "$windows_archive.sha256"
-            sha256sum --check "$linux_archive.sha256" "$windows_archive.sha256"
+            sha256sum --check "$linux_archive.sha256"
           )
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -111,8 +92,6 @@ jobs:
           path: |
             .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-musl.tar.gz
             .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-musl.tar.gz.sha256
-            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip
-            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -165,5 +144,3 @@ jobs:
           files: |
             .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-musl.tar.gz
             .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-musl.tar.gz.sha256
-            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip
-            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip.sha256

@@ -226,13 +226,6 @@ fn mount(args: MountArgs, log_path: Option<PathBuf>) -> Result<()> {
 }
 
 fn default_cache_directory() -> Result<PathBuf> {
-    #[cfg(target_os = "windows")]
-    if let Some(directory) = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        return Ok(directory.join("feishufs").join("cache"));
-    }
     user_cache_directory(
         std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
@@ -281,13 +274,6 @@ fn validate_mountpoint(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    #[cfg(target_os = "windows")]
-    if path.exists() && path.read_dir()?.next().is_some() {
-        bail!(
-            "Windows ProjFS requires an empty mountpoint; {} contains files",
-            path.display()
-        );
-    }
     Ok(())
 }
 
@@ -302,22 +288,11 @@ fn mount_session(filesystem: FeishuFs, mountpoint: &Path) -> std::io::Result<Mou
     MountSession::mount_network_with_options(filesystem, mountpoint, &options)
 }
 
-#[cfg(target_os = "windows")]
-fn mount_session(filesystem: FeishuFs, mountpoint: &Path) -> std::io::Result<MountSession> {
-    let options = MountOptions {
-        read_only: true,
-        filesystem_name: "feishufs".into(),
-        use_negative_path_cache: false,
-        ..MountOptions::default()
-    };
-    MountSession::mount_network_with_options(filesystem, mountpoint, &options)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(target_os = "linux"))]
 fn mount_session(_filesystem: FeishuFs, _mountpoint: &Path) -> std::io::Result<MountSession> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "Only Linux and Windows mount backends are supported",
+        "Only the Linux FUSE backend is supported",
     ))
 }
 
@@ -329,15 +304,7 @@ fn platform_mount_hint(mountpoint: &Path) -> String {
     )
 }
 
-#[cfg(target_os = "windows")]
-fn platform_mount_hint(mountpoint: &Path) -> String {
-    format!(
-        "Failed to start ProjFS at {}; enable Client-ProjFS in administrator PowerShell and use an empty NTFS directory",
-        mountpoint.display()
-    )
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(target_os = "linux"))]
 fn platform_mount_hint(mountpoint: &Path) -> String {
     format!(
         "Mounting {} is not supported on this platform",

@@ -329,33 +329,6 @@ fn obsolete_fetch_result_cannot_resurrect_a_removed_inode() {
 }
 
 #[test]
-fn projection_expiration_selects_only_stale_cached_files_outside_cooldown() {
-    let source = ControlledSource::new();
-    let fs = source.connect(FsOptions::default());
-    let one = inode(&fs, b"One.md");
-    let two = inode(&fs, b"Two.md");
-    fs.metadata(one).unwrap();
-    fs.metadata(two).unwrap();
-    assert!(fs.expired_projection_paths().is_empty());
-    fs.inner.content.lock().get_mut(&one).unwrap().fetched_at =
-        Instant::now() - Duration::from_secs(61);
-    assert_eq!(fs.expired_projection_paths(), ["One.md"]);
-    source
-        .source
-        .content
-        .lock()
-        .insert("obj-one".into(), Err("Offline".into()));
-    fs.metadata(one).unwrap();
-    assert!(fs.expired_projection_paths().is_empty());
-    fs.inner.failures.lock().get_mut(&one).unwrap().retry_at = Instant::now();
-    assert_eq!(fs.expired_projection_paths(), ["One.md"]);
-    source.source.children.lock().get_mut("space-1").unwrap()[0].object_token =
-        Some("replacement".into());
-    fs.refresh_now().unwrap();
-    assert!(fs.expired_projection_paths().is_empty());
-}
-
-#[test]
 fn failure_cooldown_does_not_apply_to_a_replacement_identity() {
     let source = ControlledSource::new();
     let fs = source.connect(FsOptions::default());

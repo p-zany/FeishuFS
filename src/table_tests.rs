@@ -319,7 +319,7 @@ fn csv_case_collisions_are_disambiguated_before_the_extension() {
 }
 
 #[test]
-fn unicode_long_and_reserved_csv_names_keep_a_safe_csv_extension() {
+fn unicode_and_illegal_csv_names_keep_a_safe_csv_extension() {
     let (fs, source) = table_fs("sheet");
     source.children.lock().get_mut("space-1").unwrap()[0].title = "CON".into();
     source.subtables.lock().insert(
@@ -327,7 +327,7 @@ fn unicode_long_and_reserved_csv_names_keep_a_safe_csv_extension() {
         Ok(vec![table("a", "A/B:*? ."), table("b", &"文".repeat(100))]),
     );
     fs.refresh_now().unwrap();
-    assert!(fs.tree_lines().contains(&"CON_.A_B___.csv".to_owned()));
+    assert!(fs.tree_lines().contains(&"CON.A_B___.csv".to_owned()));
     for path in fs.tree_lines() {
         assert!(path.ends_with(".csv"));
         assert!(path.len() <= 180);

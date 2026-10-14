@@ -6,8 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(any(target_os = "windows", test))]
-use crate::tree::attachment_path;
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use fsk::ROOT_INODE;
@@ -15,7 +13,6 @@ use fsk::{
     DirectoryEntry as FskDirectoryEntry, DirectorySink, Error as FsError, FileType, Filesystem,
     KernelCachePolicy, Metadata, NetworkConfiguration, NetworkFile, NetworkFilesystem,
     ReadDirectoryResult, SetMetadata, StatFs, now_ns,
-    raw::{RawEvent, RawEventMask, RawOutcome},
 };
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -23,7 +20,6 @@ use tracing::{debug, info, warn};
 use crate::{
     assets::AssetStore,
     link::KnowledgeLink,
-    platform::ProjectionController,
     refresh::{FetchSlots, RefreshBackoff},
     remote::{ContentBundle, ContentRequest, RemoteSource, RemoteSpace, RemoteTree},
     tree::{FsState, VirtualNode, VirtualNodeKind, directory_entries, file_request},
@@ -78,7 +74,6 @@ struct Inner {
     content_retry_interval: Duration,
     max_nodes: usize,
     asset_store: Option<AssetStore>,
-    projection: ProjectionController,
 }
 
 #[derive(Clone)]
@@ -150,7 +145,6 @@ impl FeishuFs {
                 content_retry_interval: options.content_retry_interval,
                 max_nodes: options.max_nodes,
                 asset_store,
-                projection: ProjectionController::new(),
             }),
         })
     }
@@ -177,12 +171,10 @@ impl FeishuFs {
         let publication = self.inner.publish_gate.lock();
         let changes = {
             let mut state = self.inner.state.write();
-            state
-                .replace(&tree)?
-                .map(|old_paths| (old_paths, state.paths(), state.file_inodes()))
+            state.replace(&tree)?.map(|_| state.file_inodes())
         };
         let revision_changed = changes.is_some();
-        if let Some((_, _, active_files)) = &changes {
+        if let Some(active_files) = &changes {
             self.inner
                 .content
                 .lock()
@@ -197,9 +189,6 @@ impl FeishuFs {
                 .retain(|inode, gate| active_files.contains(inode) || gate.strong_count() > 0);
         }
         drop(publication);
-        if let Some((old_paths, new_paths, _)) = changes {
-            self.inner.projection.invalidate(old_paths, new_paths);
-        }
         Ok(RefreshSummary {
             node_count: tree.node_count(),
             revision_changed,
@@ -253,25 +242,7 @@ impl FeishuFs {
                 }
             })
             .expect("Failed to spawn the directory refresh thread");
-        #[allow(unused_mut)]
-        let mut workers = vec![(stop_tx, join)];
-        #[cfg(target_os = "windows")]
-        {
-            let (stop_tx, stop_rx) = mpsc::channel();
-            let filesystem = self.clone();
-            let join = thread::Builder::new()
-                .name("feishufs-projection-refresh".into())
-                .spawn(move || {
-                    while matches!(
-                        stop_rx.recv_timeout(filesystem.inner.cache_ttl),
-                        Err(mpsc::RecvTimeoutError::Timeout)
-                    ) {
-                        filesystem.invalidate_expired_projections();
-                    }
-                })
-                .expect("Failed to spawn the projection refresh thread");
-            workers.push((stop_tx, join));
-        }
+        let workers = vec![(stop_tx, join)];
         RefreshHandle { workers }
     }
 
@@ -398,11 +369,11 @@ impl FeishuFs {
             }
             let existing = self.inner.content.lock().get(&inode).cloned();
             let fetched = fetched.and_then(|bundle| {
-                let paths = self.publish_assets(inode, &request, &bundle)?;
-                Ok((bundle.bytes, paths))
+                self.publish_assets(inode, &request, &bundle)?;
+                Ok(bundle.bytes)
             });
             match fetched {
-                Ok((source, asset_paths)) => {
+                Ok(source) => {
                     let source_bytes: Arc<[u8]> = Arc::from(source);
                     let (bytes, tree_revision) =
                         self.render_source(inode, &request, source_bytes.clone());
@@ -436,9 +407,6 @@ impl FeishuFs {
                     self.inner.failures.lock().remove(&inode);
                     drop(publication);
                     drop(fetching);
-                    if let Some((old_paths, new_paths)) = asset_paths {
-                        self.inner.projection.invalidate(old_paths, new_paths);
-                    }
                     return Ok(cached);
                 }
                 Err(error) => {
@@ -463,49 +431,6 @@ impl FeishuFs {
                     return Err(FsError::IO);
                 }
             }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn invalidate_expired_projections(&self) {
-        self.inner
-            .projection
-            .invalidate(self.expired_projection_paths(), Vec::new());
-    }
-
-    #[cfg(any(target_os = "windows", test))]
-    fn expired_projection_paths(&self) -> Vec<String> {
-        // ProjFS can satisfy opens without calling the provider. Expire only
-        // cached files, independently of directory changes and directory backoff.
-        {
-            let _publication = self.inner.publish_gate.lock();
-            let state = self.inner.state.read();
-            let content = self.inner.content.lock();
-            let failures = self.inner.failures.lock();
-            content
-                .iter()
-                .flat_map(|(inode, cached)| {
-                    let Some(node) = state.nodes.get(inode) else {
-                        return Vec::new();
-                    };
-                    let Ok(request) = file_request(node) else {
-                        return Vec::new();
-                    };
-                    if request.is_inline()
-                        || &cached.request != request
-                        || cached.fetched_at.elapsed() < self.inner.cache_ttl
-                        || failures.get(inode).is_some_and(|failure| {
-                            &failure.request == request && Instant::now() < failure.retry_at
-                        })
-                    {
-                        Vec::new()
-                    } else if matches!(request, ContentRequest::Download { .. }) {
-                        vec![node.path.clone(), attachment_path(*inode, &node.path)]
-                    } else {
-                        vec![node.path.clone()]
-                    }
-                })
-                .collect()
         }
     }
 
@@ -540,9 +465,9 @@ impl FeishuFs {
         owner: u64,
         request: &ContentRequest,
         bundle: &ContentBundle,
-    ) -> Result<Option<(Vec<String>, Vec<String>)>> {
+    ) -> Result<()> {
         if !request.is_markdown() && bundle.assets.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         for asset in &bundle.assets {
             let extension = crate::docx::image_extension(&asset.bytes)?;
@@ -559,8 +484,7 @@ impl FeishuFs {
             .map(|asset| (asset.name.clone(), asset.request.clone()))
             .collect();
         let mut state = self.inner.state.write();
-        let old_paths = state.asset_paths();
-        let changed = state.set_assets(owner, request, specs)?;
+        state.set_assets(owner, request, specs)?;
         let files = state.asset_files(owner);
         let active = state.file_inodes();
         let mut content = self.inner.content.lock();
@@ -598,7 +522,7 @@ impl FeishuFs {
                 },
             );
         }
-        Ok(changed.then(|| (old_paths, state.asset_paths())))
+        Ok(())
     }
 
     fn render_source(
@@ -824,14 +748,6 @@ impl Filesystem for FeishuFs {
     ) -> Result<(), FsError> {
         Self::read_only_error()
     }
-
-    fn raw_event_mask(&self) -> RawEventMask {
-        self.inner.projection.raw_event_mask()
-    }
-
-    fn raw_event(&self, event: RawEvent<'_>) -> RawOutcome {
-        self.inner.projection.raw_event(event)
-    }
 }
 
 impl NetworkFilesystem for FeishuFs {
@@ -852,27 +768,10 @@ impl NetworkFilesystem for FeishuFs {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn missing_lookup_error() -> FsError {
-    // ProjFS asks the provider about an unknown path before creating it. Access
-    // denied here makes the projection namespace read-only.
-    ACCESS_DENIED
-}
-
-#[cfg(not(target_os = "windows"))]
 fn missing_lookup_error() -> FsError {
     NOT_FOUND
 }
 
-#[cfg(target_os = "windows")]
-fn platform_name_eq(left: &[u8], right: &[u8]) -> bool {
-    match (std::str::from_utf8(left), std::str::from_utf8(right)) {
-        (Ok(left), Ok(right)) => left.to_lowercase() == right.to_lowercase(),
-        _ => left.eq_ignore_ascii_case(right),
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
 fn platform_name_eq(left: &[u8], right: &[u8]) -> bool {
     left == right
 }

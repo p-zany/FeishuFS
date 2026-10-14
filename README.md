@@ -92,7 +92,7 @@ nix run github:p-zany/feishufs -- mount 'https://example.feishu.cn/wiki/wikcnxxx
 
 ## 使用 binary
 
-从本仓库 GitHub Releases 下载对应平台的压缩包与同名 `.sha256` 文件，校验后解压；无需安装 Nix、Rust 或飞书 CLI。以下以 `v0.1.0` 为例，版本号请替换为下载的版本。
+从本仓库 GitHub Releases 下载 Linux 压缩包与同名 `.sha256` 文件，校验后解压；无需安装 Nix、Rust 或飞书 CLI。以下以 `v0.1.0` 为例，版本号请替换为下载的版本。
 
 挂载命令在解压目录中运行。
 
@@ -119,40 +119,7 @@ mkdir -p ./mnt
 ./feishufs mount 'https://example.feishu.cn/wiki/wikcnxxx' ./mnt
 ```
 
-### Windows
-
-**Windows 平台尚未测试**。提供 `x86_64-pc-windows-msvc` binary，由 Linux 交叉编译并检查 PE 格式，不代表已验证 Windows 上的运行或挂载行为。需要 x86_64 Windows 10 1809 / Windows Server 2019 或更新版本、ProjFS 和 NTFS 挂载目录。CRT 静态链接，无需另装 VC++ 运行库。
-
-在下载目录的 PowerShell 中校验并解压：
-
-```powershell
-$archive = 'feishufs-v0.1.0-x86_64-pc-windows-msvc.zip'
-$expected = (Get-Content "$archive.sha256").Split(' ')[0]
-if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) { throw 'SHA-256 mismatch' }
-Expand-Archive -Path $archive -DestinationPath .\feishufs
-Set-Location .\feishufs
-```
-
-在管理员 PowerShell 中启用 ProjFS；如系统提示需要重启，先重启：
-
-```powershell
-Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
-```
-
-然后在 binary 所在目录打开普通 PowerShell，使用空的 NTFS 目录作为挂载点：
-
-```powershell
-$env:FEISHU_APP_ID = 'cli_xxxxxxxxxxxxxxxx'
-$env:FEISHU_APP_SECRET = 'replace-me'
-
-.\feishufs.exe inspect 'https://example.feishu.cn/wiki/wikcnxxx'
-New-Item -ItemType Directory -Path .\mnt
-.\feishufs.exe mount 'https://example.feishu.cn/wiki/wikcnxxx' .\mnt
-```
-
-复用挂载路径前需清理旧投影，见[平台边界](docs/PRODUCT.md#平台与非目标)。
-
-两个平台均以前台进程运行，按 `Ctrl-C` 卸载。`inspect` 只读取目录和子表元信息，不下载正文，不能验证所有正文 / 图片的读取权限。
+以前台进程运行，按 `Ctrl-C` 卸载。`inspect` 只读取目录和子表元信息，不下载正文，不能验证所有正文 / 图片的读取权限。
 
 挂载后，将 `mnt` 交给 Agent 或其他本地工具。若已安装 ripgrep，可在另一个终端搜索：
 

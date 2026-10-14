@@ -6,7 +6,6 @@ pub mod link;
 pub mod logging;
 mod markdown;
 pub mod openlark;
-mod platform;
 mod refresh;
 pub mod remote;
 mod sdk_error;

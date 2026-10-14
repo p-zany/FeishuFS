@@ -28,8 +28,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 
-[target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_ProjectedFileSystem"] }
-
 [dev-dependencies]
 pretty_assertions = "1.4.1"

@@ -521,13 +521,6 @@ impl FsState {
         Ok(())
     }
 
-    pub fn asset_paths(&self) -> Vec<String> {
-        self.asset_inodes
-            .iter()
-            .filter_map(|inode| self.nodes.get(inode).map(|node| node.path.clone()))
-            .collect()
-    }
-
     pub fn asset_files(&self, owner: u64) -> HashMap<String, u64> {
         self.assets
             .get(&owner)
@@ -576,6 +569,7 @@ impl FsState {
             .collect()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn paths(&self) -> Vec<String> {
         self.nodes
@@ -908,10 +902,6 @@ pub fn sanitize_component(title: &str) -> String {
         trimmed.to_owned()
     };
 
-    let stem_end = output.find('.').unwrap_or(output.len());
-    if is_windows_reserved(&output[..stem_end]) {
-        output.insert(stem_end, '_');
-    }
     truncate_utf8(&mut output, MAX_COMPONENT_BYTES);
     if output.is_empty() {
         "Untitled".to_owned()
@@ -994,15 +984,6 @@ fn fold_name_bytes(value: &[u8]) -> Vec<u8> {
     String::from_utf8_lossy(value).to_lowercase().into_bytes()
 }
 
-fn is_windows_reserved(stem: &str) -> bool {
-    let upper = stem.to_ascii_uppercase();
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
-        || upper
-            .strip_prefix("COM")
-            .or_else(|| upper.strip_prefix("LPT"))
-            .is_some_and(|number| number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'))
-}
-
 pub(crate) fn file_request(node: &VirtualNode) -> Result<&ContentRequest> {
     match &node.kind {
         VirtualNodeKind::File { request } => Ok(request),
@@ -1054,9 +1035,8 @@ mod tests {
     #[test]
     fn sanitizes_cross_platform_names() {
         assert_eq!(sanitize_component(" A<B>:C. "), "A_B__C");
-        assert_eq!(sanitize_component("CON"), "CON_");
-        assert_eq!(sanitize_component("lpt9.txt"), "lpt9_.txt");
-        assert_eq!(sanitize_component("CON.md"), "CON_.md");
+        assert_eq!(sanitize_component("CON"), "CON");
+        assert_eq!(sanitize_component("CON.md"), "CON.md");
         assert_eq!(sanitize_component("..."), "Untitled");
     }
 

@@ -338,17 +338,6 @@ fn whiteboard_images_are_persisted_in_the_same_backing_namespace() {
 }
 
 #[test]
-fn expired_attachment_projections_include_original_and_asset_paths() {
-    let (fs, _source, _temporary) = test_fs(Duration::from_nanos(1));
-    let owner = original(&fs);
-    read_all(&fs, owner).unwrap();
-    let paths = fs.expired_projection_paths();
-    assert_eq!(paths.len(), 2);
-    assert!(paths.contains(&"Manual.pdf".to_owned()));
-    assert!(paths.contains(&format!(".feishufs-assets/{owner}/Manual.pdf")));
-}
-
-#[test]
 fn percent_hash_and_unicode_attachment_filenames_are_link_encoded() {
     let (fs, source, _temporary) = test_fs(Duration::from_secs(60));
     source.children.lock().get_mut("space-1").unwrap()[1].title = "报告 100% #1.pdf".into();
