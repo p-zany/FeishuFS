@@ -1,11 +1,14 @@
 # yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
+# flake.nix / flake.lock 是 inputs 与版本的单源；devenv.lock 由 `devenv update`
+# 从 flake.lock 派生，不在此重复声明 URL 或修订版本。
 inputs:
-  git-hooks:
-    url: github:cachix/git-hooks.nix
+  devenv:
+    follows: self/devenv
+  self:
+    url: path:.
   nixpkgs:
-    url: github:cachix/devenv-nixpkgs/rolling
+    follows: self/nixpkgs
+  git-hooks:
+    follows: self/git-hooks
   rust-overlay:
-    url: github:oxalica/rust-overlay
-    inputs:
-      nixpkgs:
-        follows: nixpkgs
+    follows: self/rust-overlay

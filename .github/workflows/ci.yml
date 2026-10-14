@@ -1,4 +1,4 @@
-name: CI
+name: CI and release
 
 on:
   push:
@@ -7,34 +7,163 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:
-  linux:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.tag.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust 1.88
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: devenv
+          skipPush: true
+      - name: Install pinned standalone devenv CLI
+        run: nix profile install github:cachix/devenv/2418e1b43797c44de5166176622c8d8fa0149871
+      - name: Require release tag to match Cargo.toml exactly
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        id: tag
+        shell: devenv shell -- bash -e {0}
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
-          rustup default 1.88.0
-      - name: Install FUSE headers
-        run: sudo apt-get update && sudo apt-get install --yes fuse3 libfuse3-dev
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --all-targets --all-features
+          set -uo pipefail
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "feishufs") | .version')
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "Tag must equal Cargo.toml version: v$version" >&2
+            exit 1
+          fi
+          prerelease=false
+          if [[ "${version%%+*}" == *-* ]]; then prerelease=true; fi
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+      # Native integration: https://devenv.sh/integrations/github-actions/
+      - name: Run Nix/workflow checks, Linux hooks and normal Rust tests (no live APIs or mounts)
+        shell: devenv shell -- bash -e {0}
+        run: devenv test
+      - name: Build, validate and package Linux and Windows binaries
+        shell: devenv shell -- bash -e {0}
+        run: |
+          set -uo pipefail
+          export LC_ALL=C
+          outputs=$(devenv build outputs.feishufsLinux outputs.feishufsWindows)
+          linux=$(jq -er '."outputs.feishufsLinux"' <<< "$outputs")
+          windows=$(jq -er '."outputs.feishufsWindows"' <<< "$outputs")
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "feishufs") | .version')
+          test "$("$linux/bin/feishufs" --version)" = "feishufs $version"
+          "$linux/bin/feishufs" --help
+          "$linux/bin/feishufs" inspect --help
+          "$linux/bin/feishufs" mount --help
+          # Reject ELF interpreters/shared libraries and dynamic VC++ runtimes.
+          readelf -l "$linux/bin/feishufs" > "$RUNNER_TEMP/feishufs-elf-headers.txt"
+          readelf -d "$linux/bin/feishufs" > "$RUNNER_TEMP/feishufs-elf-dynamic.txt"
+          if grep -q INTERP "$RUNNER_TEMP/feishufs-elf-headers.txt" || grep -q NEEDED "$RUNNER_TEMP/feishufs-elf-dynamic.txt"; then
+            echo "Linux binary must be statically linked" >&2
+            exit 1
+          fi
+          llvm-readobj --file-headers --coff-imports "$windows/bin/feishufs.exe" > "$RUNNER_TEMP/feishufs-pe.txt"
+          grep -q 'Format: COFF-x86-64' "$RUNNER_TEMP/feishufs-pe.txt"
+          if grep -Ei 'Name: (vcruntime|msvcp|ucrtbase|api-ms-win-crt)' "$RUNNER_TEMP/feishufs-pe.txt"; then
+            echo "Windows binary must use a static CRT" >&2
+            exit 1
+          fi
+          # Package only public release files; Nix outputs remain binary-only.
+          assets="$PWD/.cache/release"
+          linux_bundle=$(mktemp -d "$RUNNER_TEMP/feishufs-linux.XXXXXX")
+          windows_bundle=$(mktemp -d "$RUNNER_TEMP/feishufs-windows.XXXXXX")
+          linux_archive="feishufs-v$version-x86_64-unknown-linux-musl.tar.gz"
+          windows_archive="feishufs-v$version-x86_64-pc-windows-msvc.zip"
+          mkdir -p "$assets"
+          install -m755 "$linux/bin/feishufs" "$linux_bundle/feishufs"
+          install -m644 LICENSE .env.example "$linux_bundle/"
+          tar -C "$linux_bundle" --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
+            -cf - feishufs LICENSE .env.example | gzip -n > "$assets/$linux_archive"
+          diff -u <(printf '%s\n' .env.example LICENSE feishufs) <(tar -tzf "$assets/$linux_archive" | sort)
+          install -m755 "$windows/bin/feishufs.exe" "$windows_bundle/feishufs.exe"
+          install -m644 LICENSE .env.example "$windows_bundle/"
+          (
+            cd "$windows_bundle"
+            touch -t 198001010000 feishufs.exe LICENSE .env.example
+            zip -X "$assets/$windows_archive" feishufs.exe LICENSE .env.example
+          )
+          unzip -t "$assets/$windows_archive"
+          diff -u <(printf '%s\n' .env.example LICENSE feishufs.exe) <(unzip -Z1 "$assets/$windows_archive" | sort)
+          (
+            cd "$assets"
+            sha256sum "$linux_archive" > "$linux_archive.sha256"
+            sha256sum "$windows_archive" > "$windows_archive.sha256"
+            sha256sum --check "$linux_archive.sha256" "$windows_archive.sha256"
+          )
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: release
+          path: |
+            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-musl.tar.gz
+            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-musl.tar.gz.sha256
+            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip
+            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
-  windows:
-    runs-on: windows-latest
+  # The write token is never available to checkout, Nix, Cargo or repository code.
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust 1.88
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release
+          path: .cache/release
+          digest-mismatch: error
+      - name: Require unchanged remote tag and no existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ github.sha }}
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
-      - name: Check Windows targets
-        run: cargo check --all-targets --all-features
+          tag=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG")
+          while [ "$(jq -r '.object.type' <<< "$tag")" = tag ]; do
+            sha=$(jq -r '.object.sha' <<< "$tag")
+            tag=$(gh api "repos/$GH_REPO/git/tags/$sha")
+          done
+          test "$(jq -r '.object.type' <<< "$tag")" = commit
+          test "$(jq -r '.object.sha' <<< "$tag")" = "$RELEASE_COMMIT"
+          encoded_tag=$(jq -rn --arg tag "$RELEASE_TAG" '$tag | @uri')
+          status=$(curl --silent --show-error --output "$RUNNER_TEMP/release.json" \
+            --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            "$GITHUB_API_URL/repos/$GH_REPO/releases/tags/$encoded_tag")
+          case "$status" in
+            404) ;;
+            200) echo "Release already exists; refusing to replace it" >&2; exit 1 ;;
+            *) echo "Cannot check release existence (HTTP $status)" >&2; exit 1 ;;
+          esac
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.build.outputs.prerelease == 'true' && 'false' || 'true' }}
+          generate_release_notes: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          files: |
+            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-musl.tar.gz
+            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-musl.tar.gz.sha256
+            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip
+            .cache/release/feishufs-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip.sha256

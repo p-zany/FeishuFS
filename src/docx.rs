@@ -354,16 +354,16 @@ fn normalize_text(text: &str) -> String {
     let mut offset = 0;
     while offset < text.len() {
         let rest = &text[offset..];
-        if rest.starts_with('&') || rest.starts_with("\\&") {
-            if let Some(end) = rest.find(';').filter(|end| *end <= 40) {
-                let candidate = &rest[..=end];
-                let plain = candidate.replace("\\&", "&").replace("\\#", "#");
-                let decoded = html_escape::decode_html_entities(&plain);
-                if decoded != plain {
-                    output.push_str(&decoded);
-                    offset += candidate.len();
-                    continue;
-                }
+        if (rest.starts_with('&') || rest.starts_with("\\&"))
+            && let Some(end) = rest.find(';').filter(|end| *end <= 40)
+        {
+            let candidate = &rest[..=end];
+            let plain = candidate.replace("\\&", "&").replace("\\#", "#");
+            let decoded = html_escape::decode_html_entities(&plain);
+            if decoded != plain {
+                output.push_str(&decoded);
+                offset += candidate.len();
+                continue;
             }
         }
         let character = rest.chars().next().expect("nonempty text");

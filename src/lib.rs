@@ -1,3 +1,5 @@
+mod assets;
+mod csv;
 mod docx;
 pub mod filesystem;
 pub mod link;

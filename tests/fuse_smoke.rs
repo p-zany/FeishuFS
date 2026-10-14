@@ -28,6 +28,7 @@ impl RemoteSource for SmokeSource {
             // A document with child pages becomes a directory with index.md.
             "space-smoke" => vec![
                 node("root", "Root"),
+                table_node("manual", "Manual.pdf", "file", false),
                 table_node("sheet", "报表", "sheet", false),
                 table_node("base", "数据", "bitable", true),
             ],
@@ -54,7 +55,7 @@ impl RemoteSource for SmokeSource {
     fn fetch_content(&self, request: &ContentRequest) -> Result<Vec<u8>> {
         match request {
             ContentRequest::Markdown { token, .. } if token == "obj-root" => {
-                Ok(b"# Root\n\nSee [leaf](https://smoke.feishu.cn/wiki/leaf).\n".to_vec())
+                Ok(b"# Root\n\nSee [leaf](https://smoke.feishu.cn/wiki/leaf).\n[Manual](https://smoke.feishu.cn/file/obj-manual).\n".to_vec())
             }
             ContentRequest::Markdown { token, .. } if token == "obj-child" => {
                 Ok(b"# Child\n".to_vec())
@@ -66,7 +67,10 @@ impl RemoteSource for SmokeSource {
                 Ok(b"# Note\n".to_vec())
             }
             ContentRequest::TableCsv { sub_id, .. } => {
-                Ok(format!("name,value\r\n{sub_id},10\r\n").into_bytes())
+                Ok(format!("name,value,PDF\r\n{sub_id},10,https://smoke.feishu.cn/file/obj-manual\r\n").into_bytes())
+            }
+            ContentRequest::Download { token } if token == "obj-manual" => {
+                Ok(b"%PDF-1.7\n\0manual".to_vec())
             }
             ContentRequest::Whiteboard { .. } => Ok(b"\xff\xd8\xffimage".to_vec()),
             ContentRequest::Inline { bytes } => Ok(bytes.clone()),
@@ -124,11 +128,13 @@ fn mounts_reads_and_rejects_writes() {
         "/dev/fuse is unavailable"
     );
 
+    let temporary = tempfile::tempdir().unwrap();
     let link = "https://smoke.feishu.cn/wiki/root".parse().unwrap();
     let filesystem = FeishuFs::connect(
         Arc::new(SmokeSource),
         link,
         FsOptions {
+            asset_directory: Some(temporary.path().join("cache")),
             cache_ttl: Duration::from_secs(60),
             max_nodes: 10,
             ..FsOptions::default()
@@ -137,7 +143,8 @@ fn mounts_reads_and_rejects_writes() {
     .unwrap();
     let root_directory = filesystem.lookup(fsk::ROOT_INODE, b"Root").unwrap().0;
     let root_content = filesystem.lookup(root_directory, b"index.md").unwrap().0;
-    let temporary = tempfile::tempdir().unwrap();
+    let manual = filesystem.lookup(fsk::ROOT_INODE, b"Manual.pdf").unwrap().0;
+    let disk_directory = filesystem.asset_directory().unwrap().to_path_buf();
     let mountpoint = temporary.path().join("mnt");
     fs::create_dir(&mountpoint).unwrap();
     let options = MountOptions {
@@ -153,12 +160,27 @@ fn mounts_reads_and_rejects_writes() {
     assert_eq!(
         fs::read_to_string(mountpoint.join("Root/index.md")).unwrap(),
         format!(
-            "# Root\n\nSee [leaf](<Child/Leaf.md>).\n\n```mermaid\nA --> B\n```\n\n![Board](<../.feishufs-assets/{root_content}/62.jpg>)\n"
+            "# Root\n\nSee [leaf](<Child/Leaf.md>).\n[Manual](<../.feishufs-assets/{manual}/Manual.pdf>).\n\n```mermaid\nA --> B\n```\n\n![Board](<../.feishufs-assets/{root_content}/62.jpg>)\n"
         )
     );
     let image_path = mountpoint.join(format!(".feishufs-assets/{root_content}/62.jpg"));
     assert_eq!(fs::read(&image_path).unwrap(), b"\xff\xd8\xffimage");
     assert!(fs::write(&image_path, b"changed").is_err());
+    let manual_path = mountpoint.join(format!(".feishufs-assets/{manual}/Manual.pdf"));
+    assert_eq!(fs::read(&manual_path).unwrap(), b"%PDF-1.7\n\0manual");
+    assert_eq!(
+        fs::read(mountpoint.join("Manual.pdf")).unwrap(),
+        b"%PDF-1.7\n\0manual"
+    );
+    assert!(fs::write(&manual_path, b"changed").is_err());
+    assert_eq!(
+        fs::read(disk_directory.join("files/6f626a2d6d616e75616c/Manual.pdf")).unwrap(),
+        b"%PDF-1.7\n\0manual",
+    );
+    assert_eq!(
+        fs::read(disk_directory.join("whiteboards/62/62.jpg")).unwrap(),
+        b"\xff\xd8\xffimage",
+    );
     assert_eq!(
         fs::read_to_string(mountpoint.join("Root/Child/index.md")).unwrap(),
         "# Child\n"
@@ -167,21 +189,23 @@ fn mounts_reads_and_rejects_writes() {
         fs::read_to_string(mountpoint.join("Root/Child/Leaf.md")).unwrap(),
         "# Leaf\n"
     );
-    for path in ["报表.收入.csv", "数据/数据.收入.csv"] {
+    for (path, prefix) in [("报表.收入.csv", ""), ("数据/数据.收入.csv", "../")] {
         assert_eq!(
             fs::read(mountpoint.join(path)).unwrap(),
-            b"name,value\r\na,10\r\n"
+            format!("name,value,PDF\r\na,10,{prefix}.feishufs-assets/{manual}/Manual.pdf\r\n")
+                .as_bytes()
         );
         assert!(fs::write(mountpoint.join(path), b"changed").is_err());
     }
     assert_eq!(
         fs::read(mountpoint.join("报表.支出.csv")).unwrap(),
-        b"name,value\r\nb,10\r\n"
+        format!("name,value,PDF\r\nb,10,.feishufs-assets/{manual}/Manual.pdf\r\n").as_bytes()
     );
     assert_eq!(
         fs::read_to_string(mountpoint.join("数据/说明.md")).unwrap(),
         "# Note\n"
     );
+    assert!(!temporary.path().join(".feishufs-assets").exists());
     assert!(!mountpoint.join("报表.xlsx").exists());
     assert!(!mountpoint.join("数据/index.csv").exists());
     assert!(fs::write(mountpoint.join("Root/index.md"), "changed").is_err());

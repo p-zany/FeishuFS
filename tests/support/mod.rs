@@ -12,12 +12,23 @@ use feishufs::{OpenLarkOptions, OpenLarkSource};
 pub fn server(
     responses: Vec<(String, &'static str, Vec<u8>)>,
 ) -> (String, thread::JoinHandle<Vec<String>>) {
+    server_with_status(
+        responses
+            .into_iter()
+            .map(|(path, mime, bytes)| (path, 200, mime, bytes))
+            .collect(),
+    )
+}
+
+pub fn server_with_status(
+    responses: Vec<(String, u16, &'static str, Vec<u8>)>,
+) -> (String, thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
-        for (expected, content_type, body) in responses {
+        for (expected, status, content_type, body) in responses {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut stream = loop {
                 match listener.accept() {
@@ -71,7 +82,7 @@ pub fn server(
                     .contains("authorization: bearer test-user-token")
             );
             requests.push(request);
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
             stream.write_all(&body).unwrap();
         }
         requests

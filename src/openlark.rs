@@ -481,6 +481,9 @@ impl RemoteSource for OpenLarkSource {
             }
             ContentRequest::Whiteboard { token } => self.download_whiteboard(token),
             ContentRequest::Download { token } => {
+                if !valid_token(token) {
+                    bail!("Invalid attachment token");
+                }
                 let response = self
                     .runtime
                     .block_on(
@@ -491,8 +494,9 @@ impl RemoteSource for OpenLarkSource {
                     .map_err(SdkError)
                     .with_context(|| format!("Failed to download attachment {token}"))?;
                 response
-                    .data
-                    .context("Attachment download returned no data")
+                    .decode("Download attachment")
+                    .map_err(SdkError)
+                    .with_context(|| format!("Failed to download attachment {token}"))
             }
             ContentRequest::Export {
                 token,

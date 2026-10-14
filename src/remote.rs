@@ -83,6 +83,11 @@ impl ContentRequest {
     pub fn is_markdown(&self) -> bool {
         matches!(self, Self::Markdown { .. })
     }
+
+    #[must_use]
+    pub(crate) fn needs_link_rendering(&self) -> bool {
+        matches!(self, Self::Markdown { .. } | Self::TableCsv { .. })
+    }
 }
 
 /// A successful content fetch and its associated resources. This is not a

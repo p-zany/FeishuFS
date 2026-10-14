@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use feishufs::{FeishuFs, FsOptions, KnowledgeLink, OpenLarkOptions, OpenLarkSource, logging};
 use fsk::{MountOptions, MountSession};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -98,6 +98,10 @@ struct MountArgs {
 
     /// Local mountpoint
     mountpoint: PathBuf,
+
+    /// Internal disk backing cache (default: the user's cache directory)
+    #[arg(long = "cache-dir", alias = "asset-dir", value_name = "PATH")]
+    cache_directory: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -125,7 +129,7 @@ fn main() -> ExitCode {
 fn run(command: Command, log_path: Option<PathBuf>) -> Result<()> {
     match command {
         Command::Inspect(args) => {
-            let filesystem = connect(&args)?;
+            let filesystem = connect(&args, None)?;
             println!("Space: {}", filesystem.root_title());
             println!("Nodes: {}", filesystem.node_count());
             println!("Filesystem preview:");
@@ -138,7 +142,7 @@ fn run(command: Command, log_path: Option<PathBuf>) -> Result<()> {
     }
 }
 
-fn connect(args: &CommonArgs) -> Result<FeishuFs> {
+fn connect(args: &CommonArgs, asset_directory: Option<PathBuf>) -> Result<FeishuFs> {
     let link: KnowledgeLink = args.wiki_url.parse().context("Invalid space URL")?;
     let max_download_bytes = args
         .max_download_mib
@@ -161,6 +165,7 @@ fn connect(args: &CommonArgs) -> Result<FeishuFs> {
         Arc::new(source),
         link,
         FsOptions {
+            asset_directory,
             cache_ttl: args.content_ttl,
             content_retry_interval: args.content_retry_interval,
             max_nodes: args.max_nodes,
@@ -171,7 +176,12 @@ fn connect(args: &CommonArgs) -> Result<FeishuFs> {
 
 fn mount(args: MountArgs, log_path: Option<PathBuf>) -> Result<()> {
     validate_mountpoint(&args.mountpoint)?;
-    let filesystem = connect(&args.common)?;
+    let cache_directory = match args.cache_directory {
+        Some(directory) => directory,
+        None => default_cache_directory()?,
+    };
+    let cache_directory = validate_asset_directory(&cache_directory, &args.mountpoint)?;
+    let filesystem = connect(&args.common, Some(cache_directory))?;
     let session = mount_session(filesystem.clone(), &args.mountpoint)
         .with_context(|| platform_mount_hint(&args.mountpoint))?;
     let refresher = filesystem.start_refresher(args.common.refresh_interval);
@@ -186,6 +196,13 @@ fn mount(args: MountArgs, log_path: Option<PathBuf>) -> Result<()> {
         "Content TTL: {}",
         humantime::format_duration(args.common.content_ttl)
     );
+    println!(
+        "Assets directory: {}",
+        args.mountpoint.join(".feishufs-assets").display()
+    );
+    if let Some(path) = filesystem.asset_directory() {
+        debug!(path = %path.display(), "Asset backing cache enabled");
+    }
     match &log_path {
         Some(path) => println!("Log file: {}", path.display()),
         None => println!("Logging: console only (log file disabled)"),
@@ -206,6 +223,55 @@ fn mount(args: MountArgs, log_path: Option<PathBuf>) -> Result<()> {
     drop(session);
     info!("FeishuFS unmounted");
     Ok(())
+}
+
+fn default_cache_directory() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    if let Some(directory) = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(directory.join("feishufs").join("cache"));
+    }
+    user_cache_directory(
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn user_cache_directory(cache_home: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf> {
+    let directory = cache_home
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|path| path.is_absolute())
+                .map(|path| path.join(".cache"))
+        })
+        .context("No user cache directory is available; specify --cache-dir")?;
+    Ok(directory.join("feishufs"))
+}
+
+fn validate_asset_directory(directory: &Path, mountpoint: &Path) -> Result<PathBuf> {
+    let directory = resolve_path(directory)?;
+    let mountpoint = resolve_path(mountpoint)?;
+    if directory.starts_with(&mountpoint) || mountpoint.starts_with(&directory) {
+        bail!("The internal cache directory and mountpoint must not overlap");
+    }
+    Ok(directory)
+}
+
+fn resolve_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path).context("Failed to resolve an absolute path")?;
+    match absolute.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = absolute.parent().context("Path has no existing parent")?;
+            let name = absolute.file_name().context("Path has no filename")?;
+            Ok(resolve_path(parent)?.join(name))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to resolve path {}", path.display()))
+        }
+    }
 }
 
 fn validate_mountpoint(path: &Path) -> Result<()> {
@@ -326,5 +392,101 @@ mod tests {
         assert!(parse_duration("0s").is_err());
         assert!(parse_duration("invalid").is_err());
         assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn mount_does_not_create_a_second_assets_directory_in_the_working_directory() {
+        let cli = Cli::try_parse_from([
+            "feishufs",
+            "mount",
+            "https://example.feishu.cn/wiki/doc",
+            "wiki",
+            "--app-id",
+            "test-app",
+            "--app-secret",
+            "test-secret",
+        ])
+        .unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("Mount expected")
+        };
+        assert_eq!(args.cache_directory, None);
+    }
+
+    #[test]
+    fn mount_accepts_an_explicit_internal_cache_directory() {
+        for flag in ["--cache-dir", "--asset-dir"] {
+            let cli = Cli::try_parse_from([
+                "feishufs",
+                "mount",
+                "https://example.feishu.cn/wiki/doc",
+                "wiki",
+                "--app-id",
+                "test-app",
+                "--app-secret",
+                "test-secret",
+                flag,
+                "private-cache",
+            ])
+            .unwrap();
+            let Command::Mount(args) = cli.command else {
+                panic!("Mount expected")
+            };
+            assert_eq!(args.cache_directory, Some(PathBuf::from("private-cache")));
+        }
+    }
+
+    #[test]
+    fn default_cache_uses_user_locations_not_the_working_directory_or_shared_temp() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache_home = temporary.path().join("user-cache");
+        let home = temporary.path().join("user-home");
+        assert_eq!(
+            user_cache_directory(Some(cache_home.clone()), Some(home.clone())).unwrap(),
+            cache_home.join("feishufs")
+        );
+        for cache in [None, Some(PathBuf::from("relative-cache"))] {
+            assert_eq!(
+                user_cache_directory(cache, Some(home.clone())).unwrap(),
+                home.join(".cache/feishufs")
+            );
+        }
+        assert!(user_cache_directory(None, None).is_err());
+        assert!(
+            user_cache_directory(
+                Some(PathBuf::from("relative-cache")),
+                Some(PathBuf::from("relative-home"))
+            )
+            .is_err()
+        );
+        assert_eq!(temporary.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn disk_assets_and_mountpoint_cannot_overlap() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mountpoint = temporary.path().join("wiki");
+        let directory = temporary.path().join(".feishufs-assets");
+        assert_eq!(
+            validate_asset_directory(&directory, &mountpoint).unwrap(),
+            directory
+        );
+        assert!(validate_asset_directory(&mountpoint, &mountpoint).is_err());
+        assert!(
+            validate_asset_directory(&mountpoint.join(".feishufs-assets"), &mountpoint).is_err()
+        );
+        assert!(validate_asset_directory(temporary.path(), &mountpoint).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_assets_overlap_check_resolves_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        let mountpoint = temporary.path().join("wiki");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let alias = temporary.path().join("alias");
+        symlink(&mountpoint, &alias).unwrap();
+        assert!(validate_asset_directory(&alias.join(".feishufs-assets"), &mountpoint).is_err());
     }
 }

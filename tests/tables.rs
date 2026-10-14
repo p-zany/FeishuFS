@@ -3,6 +3,7 @@ mod support;
 use std::sync::Arc;
 
 use feishufs::{ContentRequest, FeishuFs, FsOptions, RemoteNode, RemoteSource, RemoteSubtable};
+use fsk::{Filesystem, ROOT_INODE};
 use serde_json::{Value, json};
 use support::{server, source};
 
@@ -248,4 +249,61 @@ fn sdk_connect_and_refresh_discover_subtables_without_exporting_any_content() {
     let requests = handle.join().unwrap();
     assert_eq!(requests.len(), 7);
     assert!(requests.iter().all(|request| request.starts_with("GET ")));
+}
+
+#[test]
+fn csv_exported_by_the_sdk_rewrites_known_pdf_and_notes_urls_without_downloading_them() {
+    let csv = concat!(
+        "\u{feff}PDF,notes,source\r\n",
+        "https://example.feishu.cn/file/filetoken,",
+        "\"https://example.feishu.cn/wiki/notes\",https://arxiv.org/abs/2604.15395\r\n",
+    );
+    let mut responses = vec![
+        json_response(
+            "GET /open-apis/wiki/v2/spaces/get_node?",
+            json!({"node": {"space_id": "space-1", "node_token": "entry"}}),
+        ),
+        json_response(
+            "GET /open-apis/wiki/v2/spaces/space-1 ",
+            json!({"space": {"space_id": "space-1", "name": "Team Wiki"}}),
+        ),
+        json_response(
+            "GET /open-apis/wiki/v2/spaces/space-1/nodes?",
+            json!({"items": [
+            {"space_id": "space-1", "node_token": "report", "obj_token": "tabletoken", "obj_type": "sheet", "title": "报表", "has_child": false},
+            {"space_id": "space-1", "node_token": "file", "obj_token": "filetoken", "obj_type": "file", "title": "Manual.pdf", "has_child": false},
+            {"space_id": "space-1", "node_token": "notes", "obj_token": "notestoken", "obj_type": "docx", "title": "Notes", "has_child": false},
+        ], "has_more": false}),
+        ),
+        json_response(
+            "GET /open-apis/sheets/v3/spreadsheets/tabletoken/sheets/query ",
+            json!({"sheets": [sheet("one", "收入", false)]}),
+        ),
+    ];
+    responses.extend(export_responses(
+        "sheet",
+        "text/csv",
+        csv.as_bytes().to_vec(),
+    ));
+    let (base, handle) = server(responses);
+    let fs = FeishuFs::connect(
+        Arc::new(source(base)),
+        "https://example.feishu.cn/wiki/entry".parse().unwrap(),
+        FsOptions::default(),
+    )
+    .unwrap();
+    let owner = fs.lookup(ROOT_INODE, b"Manual.pdf").unwrap().0;
+    let table = fs.lookup(ROOT_INODE, "报表.收入.csv".as_bytes()).unwrap().0;
+    let mut bytes = vec![0; 4096];
+    let count = fs.read(table, 0, &mut bytes).unwrap();
+    bytes.truncate(count);
+    assert_eq!(bytes, format!("\u{feff}PDF,notes,source\r\n.feishufs-assets/{owner}/Manual.pdf,\"Notes.md\",https://arxiv.org/abs/2604.15395\r\n").as_bytes());
+    assert_eq!(fs.metadata(table).unwrap().size, count as u64);
+    let requests = handle.join().unwrap();
+    assert_eq!(requests.len(), 7);
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("/files/filetoken/download"))
+    );
 }

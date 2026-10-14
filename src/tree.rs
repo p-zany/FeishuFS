@@ -65,6 +65,7 @@ pub(crate) struct FsState {
     content_path_by_token: HashMap<String, DocumentTarget>,
     assets: HashMap<u64, AssetManifest>,
     asset_inodes: HashSet<u64>,
+    attachment_owners: HashMap<u64, u64>,
     next_inode: u64,
     revision: u64,
     remote_tree: Option<RemoteTree>,
@@ -84,6 +85,7 @@ impl FsState {
             content_path_by_token: HashMap::new(),
             assets: HashMap::new(),
             asset_inodes: HashSet::new(),
+            attachment_owners: HashMap::new(),
             next_inode: ROOT_INODE + 1,
             revision: 0,
             remote_tree: None,
@@ -243,7 +245,12 @@ impl FsState {
             .clone();
         let inode = self.inode_for(&plan.key)?;
         let path = join_path(directory, file_name);
-        self.register_link_targets(building, plan.remote, &path, &request);
+        let link_path = if matches!(request, ContentRequest::Download { .. }) {
+            attachment_path(inode, &path)
+        } else {
+            path.clone()
+        };
+        self.register_link_targets(building, plan.remote, &link_path, &request);
         building.nodes.insert(
             inode,
             VirtualNode {
@@ -398,28 +405,55 @@ impl FsState {
         self.nodes
             .retain(|inode, _| !self.asset_inodes.contains(inode));
         self.asset_inodes.clear();
+        self.attachment_owners.clear();
+        let attachments: HashMap<_, _> = self
+            .nodes
+            .values()
+            .filter(|node| matches!(file_request(node), Ok(ContentRequest::Download { .. })))
+            .map(|node| (node.inode, node.clone()))
+            .collect();
         if let Some(root) = self.nodes.get_mut(&ROOT_INODE)
             && let VirtualNodeKind::Directory { entries } = &mut root.kind
         {
             entries.retain(|entry| entry.name != ASSETS_DIRECTORY.as_bytes());
             root.generation = self.revision;
         }
-        if self.assets.is_empty() {
+        if self.assets.is_empty() && attachments.is_empty() {
             return Ok(());
         }
         let root = self.inode_for("assets:root")?;
-        let mut owners: Vec<_> = self.assets.keys().copied().collect();
+        let mut owners: Vec<_> = self
+            .assets
+            .keys()
+            .chain(attachments.keys())
+            .copied()
+            .collect();
         owners.sort_unstable();
         let mut root_entries = Vec::new();
         for owner in owners {
             let directory = self.inode_for(&format!("assets:directory:{owner}"))?;
             let path = format!("{ASSETS_DIRECTORY}/{owner}");
             let mut entries = Vec::new();
-            for spec in self.assets[&owner].assets.clone() {
-                let ContentRequest::Whiteboard { token } = &spec.request else {
-                    unreachable!("validated asset request");
+            let specs = if let Some(node) = attachments.get(&owner) {
+                vec![AssetSpec {
+                    name: node.path.rsplit('/').next().expect("file name").to_owned(),
+                    request: file_request(node)?.clone(),
+                }]
+            } else {
+                self.assets[&owner].assets.clone()
+            };
+            for spec in specs {
+                let inode = match &spec.request {
+                    ContentRequest::Whiteboard { token } => {
+                        self.inode_for(&format!("assets:file:{owner}:{token}"))?
+                    }
+                    ContentRequest::Download { .. } => {
+                        let inode = self.inode_for(&format!("assets:attachment:{owner}"))?;
+                        self.attachment_owners.insert(inode, owner);
+                        inode
+                    }
+                    _ => unreachable!("validated asset request"),
                 };
-                let inode = self.inode_for(&format!("assets:file:{owner}:{token}"))?;
                 entries.push(DirectoryEntry {
                     name: spec.name.as_bytes().to_vec(),
                     inode,
@@ -482,7 +516,7 @@ impl FsState {
                 inode: root,
                 kind: FileType::Directory,
             });
-            entries.sort_by(|a, b| fold_name_bytes(&a.name).cmp(&fold_name_bytes(&b.name)));
+            entries.sort_by_key(|entry| fold_name_bytes(&entry.name));
         }
         Ok(())
     }
@@ -512,6 +546,11 @@ impl FsState {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Original attachment entries and asset entries share one fetch/cache identity.
+    pub fn content_inode(&self, inode: u64) -> u64 {
+        self.attachment_owners.get(&inode).copied().unwrap_or(inode)
     }
 
     fn inode_for(&mut self, key: &str) -> Result<u64> {
@@ -551,7 +590,7 @@ impl FsState {
         self.revision
     }
 
-    pub fn render_markdown(&self, inode: u64, request: &ContentRequest, source: &[u8]) -> Vec<u8> {
+    pub fn render_content(&self, inode: u64, request: &ContentRequest, source: &[u8]) -> Vec<u8> {
         let Some(node) = self.nodes.get(&inode) else {
             return source.to_vec();
         };
@@ -562,6 +601,16 @@ impl FsState {
             return source.to_vec();
         };
         if current_request != request {
+            return source.to_vec();
+        }
+        if matches!(request, ContentRequest::TableCsv { .. }) {
+            return crate::csv::rewrite_document_links(
+                source,
+                &node.path,
+                &self.content_path_by_token,
+            );
+        }
+        if !request.is_markdown() {
             return source.to_vec();
         }
         let Ok(markdown) = std::str::from_utf8(source) else {
@@ -700,6 +749,11 @@ fn directory_key(node_token: &str) -> String {
 
 fn content_key(node_token: &str) -> String {
     format!("content:{node_token}")
+}
+
+pub(crate) fn attachment_path(owner: u64, original_path: &str) -> String {
+    let name = original_path.rsplit('/').next().expect("file name");
+    format!("{ASSETS_DIRECTORY}/{owner}/{name}")
 }
 
 fn join_path(parent: &str, name: &str) -> String {
@@ -1052,8 +1106,16 @@ mod tests {
         let state = FsState::from_remote(&tree, 1).unwrap();
 
         let entries = directory_entries(&state.nodes[&ROOT_INODE]).unwrap();
-        assert_eq!(names_of(&state, ROOT_INODE), ["Alpha.md", "Beta.bin"]);
-        assert!(entries.iter().all(|entry| entry.kind == FileType::File));
+        assert_eq!(
+            names_of(&state, ROOT_INODE),
+            [ASSETS_DIRECTORY, "Alpha.md", "Beta.bin"]
+        );
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry.name != ASSETS_DIRECTORY.as_bytes())
+                .all(|entry| entry.kind == FileType::File)
+        );
     }
 
     #[test]
@@ -1257,7 +1319,7 @@ mod tests {
             "[子页](https://example.feishu.cn/wiki/kid)\n",
         );
         let rendered =
-            String::from_utf8(state.render_markdown(index, &branch_request, source.as_bytes()))
+            String::from_utf8(state.render_content(index, &branch_request, source.as_bytes()))
                 .unwrap();
         assert_eq!(
             rendered,

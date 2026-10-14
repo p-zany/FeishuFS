@@ -245,8 +245,16 @@ fn local_destination(
             .get(name)
             .map(|target| relative_file_path(current_file, target));
     }
+    local_document_destination(destination, current_file, targets.documents)
+}
+
+pub(crate) fn local_document_destination(
+    destination: &str,
+    current_file: &str,
+    documents: &HashMap<String, DocumentTarget>,
+) -> Option<String> {
     let link = destination.parse::<KnowledgeLink>().ok()?;
-    let target = targets.documents.get(&link.token)?;
+    let target = documents.get(&link.token)?;
     let selector = link.url.query_pairs().find_map(|(key, value)| {
         matches!(key.as_ref(), "sheet" | "table").then(|| value.into_owned())
     });

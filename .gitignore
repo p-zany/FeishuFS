@@ -9,6 +9,10 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 
+# Nix build outputs
+/result
+/result-*
+
 # Rust
 /target/
 
@@ -20,10 +24,15 @@ devenv.local.yaml
 # Local mounts and caches
 /mnt/
 /wiki/
+/.feishufs-assets/
 /.cache/
+
+# Local documentation (notes, debugging records, private examples)
+/docs/local/
 
 # Logs and editor files
 *.log
+*.log.1
 .DS_Store
 .idea/
 .vscode/

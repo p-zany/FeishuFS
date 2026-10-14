@@ -427,3 +427,162 @@ fn replacing_the_table_object_invalidates_subtable_content_identity() {
     assert_eq!(inode(&fs, "报表.收入.csv"), a);
     assert_eq!(read_all(&fs, a), b"new\n");
 }
+
+#[test]
+fn csv_pdf_and_markdown_references_share_the_mounted_assets_entry() {
+    for kind in ["sheet", "bitable"] {
+        let (fs, source) = table_fs(kind);
+        source.children.lock().get_mut("space-1").unwrap().extend([
+            leaf("file", "Manual, #1.pdf", "file"),
+            leaf("doc", "Guide", "docx"),
+        ]);
+        let csv = concat!(
+            "\u{feff}name,PDF,notes,source,summary\r\n",
+            "\"Paper, one\",\"https://example.feishu.cn/file/obj-file?from=copy#page=2\",",
+            "https://example.feishu.cn/wiki/doc,https://arxiv.org/abs/2604.15395,",
+            "\"逗号,引号\"\"与\n换行\"\r\n",
+        );
+        source
+            .content
+            .lock()
+            .insert("obj-report/a".into(), Ok(csv.as_bytes().to_vec()));
+        source.content.lock().insert(
+            "obj-doc".into(),
+            Ok(b"[PDF](https://example.feishu.cn/wiki/file#page=2)\n".to_vec()),
+        );
+        fs.refresh_now().unwrap();
+        let owner = inode(&fs, "Manual, #1.pdf");
+        let csv_inode = inode(&fs, "报表.收入.csv");
+        let expected = format!(
+            concat!(
+                "\u{feff}name,PDF,notes,source,summary\r\n",
+                "\"Paper, one\",\".feishufs-assets/{}/Manual, %231.pdf#page=2\",",
+                "Guide.md,https://arxiv.org/abs/2604.15395,",
+                "\"逗号,引号\"\"与\n换行\"\r\n",
+            ),
+            owner
+        );
+        assert_eq!(read_all(&fs, csv_inode), expected.as_bytes());
+        assert_eq!(fs.metadata(csv_inode).unwrap().size, expected.len() as u64);
+        assert_eq!(
+            fs.inner.content.lock()[&csv_inode].source_bytes.as_ref(),
+            csv.as_bytes()
+        );
+        assert_eq!(
+            read_all(&fs, inode(&fs, "Guide.md")),
+            format!("[PDF](<.feishufs-assets/{owner}/Manual, %231.pdf#page=2>)\n").as_bytes()
+        );
+        let root = fs.lookup(ROOT_INODE, b".feishufs-assets").unwrap().0;
+        let directory = fs.lookup(root, owner.to_string().as_bytes()).unwrap().0;
+        assert!(fs.lookup(directory, b"Manual, #1.pdf").is_ok());
+        assert_eq!(*source.fetches.lock(), ["obj-report/a", "obj-doc"]);
+        assert!(!fs.inner.content.lock().contains_key(&owner));
+    }
+}
+
+#[test]
+fn cached_csv_links_rerender_after_moves_renames_and_leaf_branch_conversion() {
+    let (fs, source) = table_fs("bitable");
+    source
+        .children
+        .lock()
+        .get_mut("space-1")
+        .unwrap()
+        .push(leaf("file", "Manual.pdf", "file"));
+    let csv = b"PDF\r\nhttps://example.feishu.cn/file/obj-file\r\n";
+    source
+        .content
+        .lock()
+        .insert("obj-report/a".into(), Ok(csv.to_vec()));
+    fs.refresh_now().unwrap();
+    let owner = inode(&fs, "Manual.pdf");
+    let a = inode(&fs, "报表.收入.csv");
+    assert_eq!(
+        read_all(&fs, a),
+        format!("PDF\r\n.feishufs-assets/{owner}/Manual.pdf\r\n").as_bytes()
+    );
+    let cached = fs.inner.content.lock()[&a].clone();
+    source.children.lock().insert(
+        "space-1".into(),
+        vec![
+            node("parent", "Folder", "docx"),
+            leaf("file", "Renamed.pdf", "file"),
+        ],
+    );
+    source
+        .children
+        .lock()
+        .insert("parent".into(), vec![leaf("report", "报表", "bitable")]);
+    fs.refresh_now().unwrap();
+    let parent = inode(&fs, "Folder");
+    assert_eq!(fs.lookup(parent, "报表.收入.csv".as_bytes()).unwrap().0, a);
+    assert_eq!(
+        read_all(&fs, a),
+        format!("PDF\r\n../.feishufs-assets/{owner}/Renamed.pdf\r\n").as_bytes()
+    );
+    {
+        let content = fs.inner.content.lock();
+        assert_eq!(content[&a].source_bytes.as_ref(), csv);
+        assert_eq!(content[&a].fetched_at, cached.fetched_at);
+        assert!(content[&a].generation > cached.generation);
+    }
+    source.children.lock().insert(
+        "space-1".into(),
+        vec![
+            node("parent", "Folder", "docx"),
+            node("file", "Renamed.pdf", "file"),
+        ],
+    );
+    source
+        .children
+        .lock()
+        .insert("file".into(), vec![leaf("child", "Notes", "docx")]);
+    fs.refresh_now().unwrap();
+    assert_eq!(
+        read_all(&fs, a),
+        format!("PDF\r\n../.feishufs-assets/{owner}/index.pdf\r\n").as_bytes()
+    );
+    assert_eq!(*source.fetches.lock(), ["obj-report/a"]);
+}
+
+#[test]
+fn csv_links_revert_to_the_source_url_when_an_attachment_leaves_the_mount() {
+    let (fs, source) = table_fs("sheet");
+    source
+        .children
+        .lock()
+        .get_mut("space-1")
+        .unwrap()
+        .push(leaf("file", "Manual.pdf", "file"));
+    let csv = b"PDF\nhttps://example.feishu.cn/file/obj-file\n";
+    source
+        .content
+        .lock()
+        .insert("obj-report/a".into(), Ok(csv.to_vec()));
+    fs.refresh_now().unwrap();
+    let owner = inode(&fs, "Manual.pdf");
+    let a = inode(&fs, "报表.收入.csv");
+    assert_eq!(
+        read_all(&fs, a),
+        format!("PDF\n.feishufs-assets/{owner}/Manual.pdf\n").as_bytes()
+    );
+    source
+        .children
+        .lock()
+        .insert("space-1".into(), vec![leaf("report", "报表", "sheet")]);
+    fs.refresh_now().unwrap();
+    assert_eq!(read_all(&fs, a), csv);
+    source
+        .children
+        .lock()
+        .get_mut("space-1")
+        .unwrap()
+        .push(leaf("file", "Restored.pdf", "file"));
+    fs.refresh_now().unwrap();
+    assert_eq!(inode(&fs, "Restored.pdf"), owner);
+    assert_eq!(
+        read_all(&fs, a),
+        format!("PDF\n.feishufs-assets/{owner}/Restored.pdf\n").as_bytes()
+    );
+    assert_eq!(*source.fetches.lock(), ["obj-report/a"]);
+}

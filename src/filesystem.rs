@@ -1,10 +1,13 @@
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
     sync::{Arc, Weak, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
+#[cfg(any(target_os = "windows", test))]
+use crate::tree::attachment_path;
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use fsk::ROOT_INODE;
@@ -18,6 +21,7 @@ use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::{
+    assets::AssetStore,
     link::KnowledgeLink,
     platform::ProjectionController,
     refresh::{FetchSlots, RefreshBackoff},
@@ -30,8 +34,12 @@ const ACCESS_DENIED: FsError = FsError(13);
 const NOT_DIRECTORY: FsError = FsError(20);
 const IS_DIRECTORY: FsError = FsError(21);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FsOptions {
+    /// Optional internal backing cache for downloaded attachments and images.
+    /// This is not the visible `.feishufs-assets` directory in the mount.
+    /// The CLI uses the user's cache directory; library callers can opt in.
+    pub asset_directory: Option<PathBuf>,
     pub cache_ttl: Duration,
     pub content_retry_interval: Duration,
     pub max_concurrent_fetches: usize,
@@ -41,6 +49,7 @@ pub struct FsOptions {
 impl Default for FsOptions {
     fn default() -> Self {
         Self {
+            asset_directory: None,
             cache_ttl: Duration::from_secs(60),
             content_retry_interval: Duration::from_secs(5),
             max_concurrent_fetches: 4,
@@ -68,6 +77,7 @@ struct Inner {
     cache_ttl: Duration,
     content_retry_interval: Duration,
     max_nodes: usize,
+    asset_store: Option<AssetStore>,
     projection: ProjectionController,
 }
 
@@ -113,6 +123,17 @@ impl FeishuFs {
         let tree = RemoteTree::load(source.as_ref(), &link, options.max_nodes)?;
         let state = FsState::from_remote(&tree, now_ns())
             .context("Failed to build the initial filesystem snapshot")?;
+        let asset_store = options
+            .asset_directory
+            .as_deref()
+            .map(|directory| {
+                AssetStore::new(
+                    directory,
+                    link.url.host_str().context("Space URL has no hostname")?,
+                    &tree.space_id,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             inner: Arc::new(Inner {
                 source,
@@ -128,9 +149,16 @@ impl FeishuFs {
                 cache_ttl: options.cache_ttl,
                 content_retry_interval: options.content_retry_interval,
                 max_nodes: options.max_nodes,
+                asset_store,
                 projection: ProjectionController::new(),
             }),
         })
+    }
+
+    /// Internal on-disk cache namespace, not the user-facing assets entry.
+    #[must_use]
+    pub fn asset_directory(&self) -> Option<&Path> {
+        self.inner.asset_store.as_ref().map(AssetStore::root)
     }
 
     pub fn refresh_now(&self) -> Result<RefreshSummary> {
@@ -342,6 +370,7 @@ impl FeishuFs {
         inode: u64,
         refresh_if_expired: bool,
     ) -> Result<CachedContent, FsError> {
+        let inode = self.inner.state.read().content_inode(inode);
         loop {
             if let Some(cached) = self.cached_content(inode, refresh_if_expired)? {
                 return Ok(cached);
@@ -355,7 +384,10 @@ impl FeishuFs {
             let permit = self.inner.fetch_slots.acquire();
             let node = self.node(inode)?;
             let request = file_request(&node).map_err(|_| IS_DIRECTORY)?.clone();
-            let fetched = self.inner.source.fetch_bundle(&request);
+            let fetched = self.inner.source.fetch_bundle(&request).and_then(|bundle| {
+                self.persist_downloads(&node, &bundle)?;
+                Ok(bundle)
+            });
             drop(permit);
 
             let publication = self.inner.publish_gate.lock();
@@ -452,9 +484,13 @@ impl FeishuFs {
             let failures = self.inner.failures.lock();
             content
                 .iter()
-                .filter_map(|(inode, cached)| {
-                    let node = state.nodes.get(inode)?;
-                    let request = file_request(node).ok()?;
+                .flat_map(|(inode, cached)| {
+                    let Some(node) = state.nodes.get(inode) else {
+                        return Vec::new();
+                    };
+                    let Ok(request) = file_request(node) else {
+                        return Vec::new();
+                    };
                     if request.is_inline()
                         || &cached.request != request
                         || cached.fetched_at.elapsed() < self.inner.cache_ttl
@@ -462,13 +498,41 @@ impl FeishuFs {
                             &failure.request == request && Instant::now() < failure.retry_at
                         })
                     {
-                        None
+                        Vec::new()
+                    } else if matches!(request, ContentRequest::Download { .. }) {
+                        vec![node.path.clone(), attachment_path(*inode, &node.path)]
                     } else {
-                        Some(node.path.clone())
+                        vec![node.path.clone()]
                     }
                 })
                 .collect()
         }
+    }
+
+    fn persist_downloads(&self, node: &VirtualNode, bundle: &ContentBundle) -> Result<()> {
+        let Some(store) = &self.inner.asset_store else {
+            return Ok(());
+        };
+        let request = file_request(node)?;
+        if matches!(request, ContentRequest::Download { .. }) {
+            let name = node
+                .path
+                .rsplit('/')
+                .next()
+                .context("Attachment has no filename")?;
+            store.persist(request, name, &bundle.bytes)?;
+        }
+        for asset in &bundle.assets {
+            let extension = crate::docx::image_extension(&asset.bytes)?;
+            if asset.name.rsplit_once('.').map(|(_, value)| value) != Some(extension) {
+                bail!(
+                    "Asset image format does not match its filename: {}",
+                    asset.name
+                );
+            }
+            store.persist(&asset.request, &asset.name, &asset.bytes)?;
+        }
+        Ok(())
     }
 
     fn publish_assets(
@@ -545,15 +609,15 @@ impl FeishuFs {
     ) -> (Arc<[u8]>, u64) {
         let state = self.inner.state.read();
         let revision = state.revision();
-        if !request.is_markdown() {
+        if !request.needs_link_rendering() {
             return (source, revision);
         }
-        let rendered = state.render_markdown(inode, request, &source);
+        let rendered = state.render_content(inode, request, &source);
         (Arc::from(rendered), revision)
     }
 
     fn rerender_if_needed(&self, inode: u64, cached: CachedContent) -> CachedContent {
-        if !cached.request.is_markdown() {
+        if !cached.request.needs_link_rendering() {
             return cached;
         }
         let state = self.inner.state.read();
@@ -561,7 +625,7 @@ impl FeishuFs {
             return cached;
         }
         let revision = state.revision();
-        let rendered = state.render_markdown(inode, &cached.request, &cached.source_bytes);
+        let rendered = state.render_content(inode, &cached.request, &cached.source_bytes);
         drop(state);
         if rendered.as_slice() == cached.bytes.as_ref() {
             return CachedContent {
@@ -812,6 +876,10 @@ fn platform_name_eq(left: &[u8], right: &[u8]) -> bool {
 fn platform_name_eq(left: &[u8], right: &[u8]) -> bool {
     left == right
 }
+
+#[cfg(test)]
+#[path = "attachment_tests.rs"]
+mod attachment_tests;
 
 #[cfg(test)]
 #[path = "refresh_tests.rs"]
