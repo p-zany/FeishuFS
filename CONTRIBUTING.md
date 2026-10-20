@@ -26,7 +26,7 @@ secretspec run --provider dotenv -- ./target/debug/feishufs inspect '<link>'
 
 `FEISHU_USER_ACCESS_TOKEN` 和 `FEISHU_API_BASE_URL` 可不填；不设置 API 地址时保留飞书 / Lark 链接的自动选择。SecretSpec 将 `.env` 解析为 dotenv 数据，而不是执行 Bash；仅在启动所需子进程时注入声明的变量，不改变父 shell。不要用凭证包裹 `devenv` 或构建命令，也不要将凭证映射到 Nix `env` / store。
 
-系统挂载条件见 README 的 [Linux](README.md#linux) 用法；不用 Nix 时，参照 [Linux 源码构建](README.md#从源码构建linux)准备工具链。常规测试无需凭证或 FUSE 设备。
+系统挂载条件见使用指南的 [Linux 挂载条件](docs/USAGE.md#linux-挂载条件)；不用 Nix 时，参照[从源码构建](docs/USAGE.md#从源码构建)准备工具链。常规测试无需凭证或 FUSE 设备。
 
 ## 常规检查
 
@@ -88,7 +88,7 @@ git tag -a v0.1.0 -m 'Release v0.1.0'
 git push origin v0.1.0
 ```
 
-版本含 `-rc.1` 等 prerelease 后缀时，发布为预发布且不标为 Latest。Workflow 在发布前确认远端 tag 仍指向触发提交、release 尚不存在，不移动 tag、不覆盖已有 release 或同名附件；失败后先检查 Actions 日志与 Releases 状态，没有 release 时可重跑，已有 release 时停止并人工检查，不移动已发布 tag。运行依赖和下载用法见 [README](README.md#使用-binary)。
+版本含 `-rc.1` 等 prerelease 后缀时，发布为预发布且不标为 Latest。Workflow 在发布前确认远端 tag 仍指向触发提交、release 尚不存在，不移动 tag、不覆盖已有 release 或同名附件；失败后先检查 Actions 日志与 Releases 状态，没有 release 时可重跑，已有 release 时停止并人工检查，不移动已发布 tag。运行依赖和下载用法见[使用指南](docs/USAGE.md#使用发布包)。
 
 ## 提交要求
 
@@ -101,7 +101,7 @@ Git hooks 依赖开发环境中的 `cc`、`cargo` 等工具。提交时使用 `d
 
 ## 文档维护
 
-- README 负责产品介绍与用法，其他文档分工见 [文档索引](README.md#文档)。一个事实只保留一个主位置，其他地方用链接引用。
+- README 负责产品介绍与快速开始，授权和详细用法见[文档索引](README.zh-CN.md#文档)。中英文 README、授权和使用指南应同步更新；同一语言内，一个事实只保留一个主位置，其他地方用链接引用。
 - 写当前能力、限制和理由，不保留“本轮”“本次已授权”等过程叙述。路线图区分候选、待验证和未决策略。
 - 构建、测试、关键不变量和长期技术决策随代码公开；易变的函数细节优先放代码注释与测试。
 - 临时实现笔记、调试记录和私有样例放 `docs/local/`；本机诊断脚本放 `scripts/`。两处均被 Git 忽略，不作为公开构建或检查的依赖。忽略规则不保护已跟踪或强制添加的文件；需要共享的私密记录应使用独立私有存储。
