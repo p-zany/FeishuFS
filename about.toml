@@ -1,0 +1,40 @@
+# License selection for the distributed Linux binary, including transitive deps.
+accepted = ["MIT", "Apache-2.0", "ISC", "BSD-3-Clause", "Unicode-3.0"]
+targets = ["x86_64-unknown-linux-musl"]
+ignore-dev-dependencies = true
+workarounds = ["chrono"]
+
+[private]
+ignore = true
+
+# Keep the complete upstream notice, including bundled native code attributions.
+[aws-lc-rs.clarify]
+license = "ISC AND (Apache-2.0 OR ISC)"
+
+[[aws-lc-rs.clarify.files]]
+path = "LICENSE"
+checksum = "b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7"
+
+# Keep the complete upstream notice, including bundled native code attributions.
+[aws-lc-sys.clarify]
+license = "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)"
+
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+license = "Apache-2.0"
+
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+license = "ISC"
+
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+license = "MIT"
+
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+license = "BSD-3-Clause"

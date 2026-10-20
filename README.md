@@ -31,21 +31,21 @@
 
 ### 配置接口权限
 
-在 **开发配置 > 权限管理** 中按所需能力申请权限。以下是读取 / 导出能力提示，不是完整的最低权限清单；具体要求以接口文档及控制台为准。
+在 **开发配置 > 权限管理** 中按实际使用的功能申请权限。[权限导入示例](misc/feishu-scopes.json)只包含读取、下载和导出权限，`tenant` / `user` 分别供应用身份 / 用户身份使用；仅使用应用身份时可删去 `user` 列表。
 
-| 内容 | 权限提示 |
-| --- | --- |
-| 知识库 | 空间与节点读取，如 `wiki:wiki:readonly` |
-| Docx | 文档正文读取，如 `docx:document:readonly`；正文接口的实际要求以控制台为准 |
-| 电子表格 | [工作表读取](https://open.feishu.cn/document/server-docs/docs/sheets-v3/spreadsheet-sheet/query)，如 `sheets:spreadsheet:readonly`；下方 JSON 未包含此类权限，CSV 还需导出权限 |
-| 多维表格 | 数据表读取，如 `bitable:app:readonly`；CSV 还需导出权限 |
-| 旧版文档 / 表格 CSV | [云文档导出](https://open.feishu.cn/document/server-docs/docs/drive-v1/export_task/create)，如 `docs:document:export` |
-| 文件 | [云空间文件下载](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/drive-v1/file/download)，如 `drive:file:download`；下方 JSON 未包含此类权限，还需目标文件的下载授权 |
-| 无 Mermaid 源码的画板 | `board:whiteboard:node:read` |
+| 功能 | 示例权限 | 对应接口 |
+| --- | --- | --- |
+| 定位知识库、读取空间和节点目录 | `wiki:wiki:readonly` | [获取节点](https://open.feishu.cn/document/server-docs/docs/wiki-v2/space/get_node)、[空间信息](https://open.feishu.cn/document/server-docs/docs/wiki-v2/space/get)、[子节点列表](https://open.feishu.cn/document/server-docs/docs/wiki-v2/space-node/list) |
+| Docx 正文 | `docx:document:readonly` | Docs AI Fetch；权限参考官方 CLI 的 [fetch 声明](https://github.com/larksuite/cli/blob/017b19a793ad71794a02887ede04757f3d82e10d/shortcuts/doc/docs_fetch.go) |
+| 电子表格工作表清单 | `sheets:spreadsheet:read` | [查询工作表](https://open.feishu.cn/document/server-docs/docs/sheets-v3/spreadsheet-sheet/query) |
+| 多维表格数据表清单 | `base:table:read` | [列出数据表](https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table/list) |
+| 旧版文档 / 表格 CSV | `docs:document:export` | [导出任务](https://open.feishu.cn/document/server-docs/docs/drive-v1/export_task/create)及结果下载 |
+| 文件节点下载 | `drive:file:download` | [下载文件](https://open.feishu.cn/document/server-docs/docs/drive-v1/file/download) |
+| 无 Mermaid 源码的画板 | `board:whiteboard:node:read` | [画板图片下载](https://open.feishu.cn/document/server-docs/board-v1/whiteboard/download_as_image) |
 
-[原始权限 JSON](misc/feishu-scopes.json)是用户提供的**现有应用权限清单**，仅保存权限名：`tenant` 含创建 / 写入权限，`user` 为空。它**不是最低只读清单，也不保证覆盖所有功能**。FeishuFS 不调用云端文档写 API，但如此广权限的凭证仍可被其他程序用于写入；新应用应按实际需要选择权限。
+这是一份按当前调用接口整理的权限起点，**尚未使用全新应用逐项验证为最低权限集合**。不使用的内容类型可移除对应权限；但目录遍历遇到表格时仍需读取子表清单，`inspect` 也会用到这部分权限。电子表格使用当前的 `sheets:spreadsheet:read` 名称，旧的 `sheets:spreadsheet:readonly` 说明见[官方 CLI 维护者确认](https://github.com/larksuite/cli/issues/838)。Docs AI Fetch 的权限参考官方 CLI，不能把其他正文接口的权限要求直接视为本接口的完整保证。
 
-如需复用该清单，在 **开发配置 > 权限管理 > 批量导入/导出权限 > 导入** 中粘贴 JSON，点击 **下一步，确认新增权限**，核对后点击 **申请开通**。导入只新增申请，不移除已有权限；需审核的权限仍须发布与审批。官方流程见[申请 API 权限](https://open.feishu.cn/document/ukTMukTMukTM/uQjN3QjL0YzN04CN2cDN)。使用用户访问凭证时，需另按接口要求申请用户身份权限，不能把该 JSON 的空 `user` 清单视为已授权。
+导入时，在 **开发配置 > 权限管理 > 批量导入/导出权限 > 导入** 中粘贴 JSON，确认后申请开通并完成发布 / 审批。**导入不会移除已有权限**；已有应用如需收紧权限，应另行检查并撤销不再需要的写入、删除和权限管理授权。官方操作流程见[申请 API 权限](https://open.feishu.cn/document/ukTMukTMukTM/uQjN3QjL0YzN04CN2cDN)。使用用户访问凭证时，还需用户以相应 scopes 授权；应用勾选了 `user` 权限不代表现有 token 已包含它们。
 
 ### 发布与知识库访问授权
 
@@ -186,4 +186,4 @@ cargo install --path . --locked
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE)。发布包同时附带第三方依赖、Rust 标准库和 musl 的许可声明，重新分发时应一并保留。

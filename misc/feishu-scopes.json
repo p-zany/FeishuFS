@@ -1,23 +1,22 @@
 {
   "scopes": {
     "tenant": [
-      "base:table:read",
-      "bitable:app",
-      "bitable:app:readonly",
-      "board:whiteboard:node:read",
-      "docs:document.content:read",
-      "docs:document:export",
-      "docx:document",
-      "docx:document.block:convert",
-      "docx:document:create",
+      "wiki:wiki:readonly",
       "docx:document:readonly",
-      "docx:document:write_only",
-      "wiki:node:read",
-      "wiki:space:read",
-      "wiki:space:retrieve",
-      "wiki:wiki",
-      "wiki:wiki:readonly"
+      "sheets:spreadsheet:read",
+      "base:table:read",
+      "docs:document:export",
+      "drive:file:download",
+      "board:whiteboard:node:read"
     ],
-    "user": []
+    "user": [
+      "wiki:wiki:readonly",
+      "docx:document:readonly",
+      "sheets:spreadsheet:read",
+      "base:table:read",
+      "docs:document:export",
+      "drive:file:download",
+      "board:whiteboard:node:read"
+    ]
   }
 }

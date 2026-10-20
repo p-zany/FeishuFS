@@ -33,7 +33,7 @@ jobs:
           skipPush: true
       - name: Install pinned standalone devenv CLI
         run: nix profile install github:cachix/devenv/2418e1b43797c44de5166176622c8d8fa0149871
-      - name: Require release tag to match Cargo.toml exactly
+      - name: Validate release tag and derive prerelease flag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         id: tag
         shell: devenv shell -- bash -e {0}
@@ -47,9 +47,9 @@ jobs:
           prerelease=false
           if [[ "${version%%+*}" == *-* ]]; then prerelease=true; fi
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-      # Native integration: https://devenv.sh/integrations/github-actions/
-      - name: Run Nix/workflow checks, Linux hooks and normal Rust tests (no live APIs or mounts)
-        shell: devenv shell -- bash -e {0}
+      - name: Install fuse3 for the FUSE smoke test
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+      - name: Run devenv hooks and the FUSE smoke test
         run: devenv test
       - name: Build, validate and package the Linux binary
         shell: devenv shell -- bash -e {0}
@@ -63,23 +63,19 @@ jobs:
           "$linux/bin/feishufs" --help
           "$linux/bin/feishufs" inspect --help
           "$linux/bin/feishufs" mount --help
-          # Reject ELF interpreters/shared libraries.
-          readelf -l "$linux/bin/feishufs" > "$RUNNER_TEMP/feishufs-elf-headers.txt"
-          readelf -d "$linux/bin/feishufs" > "$RUNNER_TEMP/feishufs-elf-dynamic.txt"
-          if grep -q INTERP "$RUNNER_TEMP/feishufs-elf-headers.txt" || grep -q NEEDED "$RUNNER_TEMP/feishufs-elf-dynamic.txt"; then
-            echo "Linux binary must be statically linked" >&2
-            exit 1
-          fi
-          # Package only public release files; Nix outputs remain binary-only.
+          # Package only the binary, public templates and license notices.
           assets="$PWD/.cache/release"
           linux_bundle=$(mktemp -d "$RUNNER_TEMP/feishufs-linux.XXXXXX")
           linux_archive="feishufs-v$version-x86_64-unknown-linux-musl.tar.gz"
           mkdir -p "$assets"
           install -m755 "$linux/bin/feishufs" "$linux_bundle/feishufs"
-          install -m644 LICENSE .env.example "$linux_bundle/"
+          install -m644 .env.example "$linux_bundle/"
+          install -m644 "$linux/share/licenses/feishufs/"* "$linux_bundle/"
           tar -C "$linux_bundle" --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
-            -cf - feishufs LICENSE .env.example | gzip -n > "$assets/$linux_archive"
-          diff -u <(printf '%s\n' .env.example LICENSE feishufs) <(tar -tzf "$assets/$linux_archive" | sort)
+            -cf - feishufs LICENSE .env.example THIRD_PARTY_LICENSES.html RUST-STDLIB.html MUSL-COPYRIGHT.txt \
+            | gzip -n > "$assets/$linux_archive"
+          diff -u <(printf '%s\n' .env.example LICENSE MUSL-COPYRIGHT.txt RUST-STDLIB.html THIRD_PARTY_LICENSES.html feishufs) \
+            <(tar -tzf "$assets/$linux_archive" | sort)
           (
             cd "$assets"
             sha256sum "$linux_archive" > "$linux_archive.sha256"

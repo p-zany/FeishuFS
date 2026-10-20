@@ -28,7 +28,7 @@ CLI / 环境变量
 
 具体依赖以 [`Cargo.toml`](../Cargo.toml) 为准。Docx 使用 Docs AI Fetch 读取 XML；导出任务虽使用 POST，但不修改源文档。项目没有云端文档写 API。
 
-[`devenv.nix`](../devenv.nix) 唯一定义开发环境、常规检查与 binary 编译；inputs 以 `flake.nix` / `flake.lock` 为单源，`devenv.yaml` 通过 `self: path:.` 加 `follows: self/<input>` 继承，`devenv.lock` 由 `devenv update` 从 `flake.lock` 派生。[`flake.nix`](../flake.nix) 通过 devenv 原生 `lib.mkConfig` 求值同一模块，仅暴露 Linux package / app，不构建开发 shell 或执行 hooks。两者共用 `rust-toolchain.toml` 与同一组锁定 inputs。Nix 只输出 binary，CI 通过 devenv 编译，在 workflow 的 `run:` 中打包与生成校验文件，再由 `gh-release` 上传。只支持 x86_64 Linux 构建主机与运行平台。命令及检查范围见[贡献指南](../CONTRIBUTING.md)。
+[`devenv.nix`](../devenv.nix) 唯一定义开发环境、常规检查与 binary 编译；inputs 以 `flake.nix` / `flake.lock` 为单源，`devenv.yaml` 通过 `self: path:.` 加 `follows: self/<input>` 继承，`devenv.lock` 由 `devenv update` 从 `flake.lock` 派生。[`flake.nix`](../flake.nix) 通过 devenv 原生 `lib.mkConfig` 求值同一模块，仅暴露 Linux package / app，不构建开发 shell 或执行 hooks。两者共用 `rust-toolchain.toml` 与同一组锁定 inputs。Nix 输出 binary 及依赖 / 运行时许可声明，CI 通过 devenv 执行 hooks、冒烟和编译，在 workflow 的 `run:` 中打包与生成校验文件，再由 `gh-release` 上传。只支持 x86_64 Linux 构建主机与运行平台。命令及检查范围见[贡献指南](../CONTRIBUTING.md)。
 
 ## 代码地图
 

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>FeishuFS third-party licenses</title>
+<style>body { max-width: 70rem; margin: 2rem auto; padding: 0 1rem; font-family: sans-serif; } pre { white-space: pre-wrap; }</style>
+<h1>FeishuFS third-party licenses</h1>
+<p>Generated from Cargo.lock for x86_64-unknown-linux-musl. FeishuFS itself is covered by the accompanying LICENSE file.</p>
+<p>Package authors are taken from upstream metadata. Where an upstream package omits a standalone license file, its declared SPDX license text is included.</p>
+{{#each licenses}}
+<section>
+<h2>{{name}} ({{id}})</h2>
+<ul>
+{{#each used_by}}
+<li>{{crate.name}} {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}{{#if crate.authors}}<br>Package authors: {{#each crate.authors}}{{this}}; {{/each}}{{/if}}</li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+</section>
+{{/each}}
+</html>

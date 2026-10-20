@@ -29,6 +29,7 @@ devenv.local.yaml
 
 # Local documentation (notes, debugging records, private examples)
 /docs/local/
+/scripts/
 
 # Logs and editor files
 *.log

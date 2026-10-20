@@ -9,11 +9,15 @@ let
   toolchain = config.languages.rust.toolchainPackage;
   manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
   inherit (manifest.package) version;
+  musl = pkgs.pkgsCross.musl64.stdenv.cc.libc;
   # Only these sources enter the build sandbox, never .env, docs/local,
   # tests/fixtures, logs, target or caches from the working tree.
   sourceFiles = lib.fileset.unions [
     ./Cargo.toml
     ./Cargo.lock
+    ./LICENSE
+    ./about.toml
+    ./misc/third-party-licenses.hbs
     (lib.fileset.fileFilter (file: file.hasExt "rs") ./src)
   ];
   src = lib.fileset.toSource {
@@ -41,8 +45,30 @@ let
   linux = muslPlatform.buildRustPackage (
     common
     // {
-      nativeBuildInputs = [ pkgs.cmake ];
-      env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-C target-feature=+crt-static";
+      # aws-lc-sys 的构建脚本需要 cmake；musl 目标默认 crt-static，无需额外 RUSTFLAGS。
+      nativeBuildInputs = [
+        pkgs.cmake
+        pkgs.cargo-about
+      ];
+      postInstall = ''
+        notices="$out/share/licenses/feishufs"
+        mkdir -p "$notices"
+        cp LICENSE "$notices/LICENSE"
+        # cargo-about can fall back after a clarification checksum mismatch.
+        # Treat warnings as failures so changed notices require review.
+        cargo about -L warn --color never generate --offline --locked --fail \
+          misc/third-party-licenses.hbs --output-file "$notices/THIRD_PARTY_LICENSES.html" \
+          2> license-diagnostics.log || { cat license-diagnostics.log >&2; exit 1; }
+        if [ -s license-diagnostics.log ]; then
+          cat license-diagnostics.log >&2
+          exit 1
+        fi
+        cp ${toolchain}/share/doc/rust/COPYRIGHT-library.html "$notices/RUST-STDLIB.html"
+        tar -xOf ${musl.src} musl-${musl.version}/COPYRIGHT > "$notices/MUSL-COPYRIGHT.txt"
+        test -s "$notices/THIRD_PARTY_LICENSES.html"
+        test -s "$notices/RUST-STDLIB.html"
+        test -s "$notices/MUSL-COPYRIGHT.txt"
+      '';
     }
   );
 
@@ -53,23 +79,17 @@ in
     toolchainFile = ./rust-toolchain.toml;
   };
 
-  # The CLI bundled with devenv loads dotenv credentials only for the app:
-  # secretspec run --provider dotenv -- ./target/debug/feishufs inspect '<link>'
-  # Keep normal shells, checks and builds credential-free.
-
-  packages = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+  packages = [
     pkgs.lark-cli
     pkgs.nixfmt
     pkgs.actionlint
+    pkgs.cargo-about
     pkgs.jq
-    pkgs.binutils
     pkgs.gnutar
     pkgs.gzip
   ];
 
-  # Binary-only outputs, also consumed by flake.nix through devenv.lib.mkConfig.
-  # Validation and release packaging live in the CI workflow, not derivations.
-  outputs = lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+  outputs = {
     feishufsLinux = linux;
   };
 
@@ -80,33 +100,23 @@ in
       settings = {
         allFeatures = true;
         denyWarnings = true;
+        extraArgs = "--locked --all-targets";
       };
     };
     nixfmt.enable = true;
+    actionlint.enable = true;
+    cargo-test = {
+      enable = true;
+      entry = "cargo test --locked --all-targets --all-features";
+      pass_filenames = false;
+    };
   };
 
+  # 常规检查全部由 git hooks 覆盖；enterTest 只保留需要真实挂载的 FUSE 冒烟。
   tasks = {
-    "feishufs:nix-format".exec = "nixfmt --check flake.nix devenv.nix";
-    "feishufs:workflow".exec = "actionlint .github/workflows/ci.yml";
-    "feishufs:fmt".exec = "cargo fmt --all -- --check";
-    "feishufs:clippy".exec = "cargo clippy --locked --all-targets --all-features -- -D warnings";
-    "feishufs:test".exec = "cargo test --locked --all-targets --all-features";
-    "feishufs:smoke-linux".exec = ''
-      if [ "''${FEISHUFS_FUSE_SUDO:-0}" = 1 ]; then
-        cargo test --test fuse_smoke --no-run
-        test_binary="$(${pkgs.findutils}/bin/find target/debug/deps -maxdepth 1 -type f -name 'fuse_smoke-*' -perm -u+x -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
-        sudo env PATH="$PATH" "$test_binary" --ignored --nocapture
-      else
-        cargo test --test fuse_smoke -- --ignored --nocapture
-      fi
-    '';
+    "feishufs:smoke-linux" = {
+      exec = "cargo test --locked --test fuse_smoke -- --ignored --nocapture";
+      wantedBy = [ "devenv:enterTest" ];
+    };
   };
-
-  enterTest = ''
-    nixfmt --check flake.nix devenv.nix
-    actionlint .github/workflows/ci.yml
-    cargo fmt --all -- --check
-    cargo clippy --locked --all-targets --all-features -- -D warnings
-    cargo test --locked --all-targets --all-features
-  '';
 }

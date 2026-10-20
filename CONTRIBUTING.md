@@ -11,7 +11,7 @@ devenv shell
 cargo build --locked
 ```
 
-开发环境与 binary 编译由 [`devenv.nix`](devenv.nix) 管理。inputs 以 [`flake.nix`](flake.nix) / [`flake.lock`](flake.lock) 为单源：[`devenv.yaml`](devenv.yaml) 通过 `self: path:.` 与 `follows: self/<input>` 从 flake 继承 nixpkgs、devenv 模块、rust-overlay 和 git-hooks，[`devenv.lock`](devenv.lock) 只是 `devenv update` 从 `flake.lock` 派生的锁，版本不再两处维护。工具链与两个交叉目标统一定义在 [`rust-toolchain.toml`](rust-toolchain.toml)。[`flake.nix`](flake.nix) 通过 devenv 原生 `lib.mkConfig` 求值同一模块，只暴露 Linux 应用的 package / app，不管理开发 shell，也不执行 hooks；Nix 用户无需安装 devenv CLI 或使用 `--impure`。升级时先 `nix flake update`（可用 `nix flake update <input>` 只升级指定 input），再运行 `devenv update` 重新派生 devenv.lock 并检查；`flake.nix` 与 `flake.lock` 必须提交，devenv CLI 和远端 Nix 用户都依赖它们。
+开发环境与 binary 编译由 [`devenv.nix`](devenv.nix) 管理。inputs 以 [`flake.nix`](flake.nix) / [`flake.lock`](flake.lock) 为单源：[`devenv.yaml`](devenv.yaml) 通过 `self: path:.` 与 `follows: self/<input>` 从 flake 继承 nixpkgs、devenv 模块、rust-overlay 和 git-hooks，[`devenv.lock`](devenv.lock) 只是 `devenv update` 从 `flake.lock` 派生的锁，版本不再两处维护。工具链与 musl 目标统一定义在 [`rust-toolchain.toml`](rust-toolchain.toml)。[`flake.nix`](flake.nix) 通过 devenv 原生 `lib.mkConfig` 求值同一模块，只暴露 Linux 应用的 package / app，不管理开发 shell，也不执行 hooks；Nix 用户无需安装 devenv CLI 或使用 `--impure`。升级时先 `nix flake update`（可用 `nix flake update <input>` 只升级指定 input），再运行 `devenv update` 重新派生 devenv.lock 并检查；`flake.nix` 与 `flake.lock` 必须提交，devenv CLI 和远端 Nix 用户都依赖它们。
 
 更新 `rust-toolchain.toml` 后，退出旧的 `devenv shell` 再重新进入，并用 `rustc --version` / `cargo --version` 确认版本；已打开的 shell 不会自动切换工具链。
 
@@ -34,7 +34,7 @@ secretspec run --provider dotenv -- ./target/debug/feishufs inspect '<link>'
 devenv test
 ```
 
-与 CI 一致：由 devenv 执行 hooks、Nix 格式、workflow 语法、Rust fmt / clippy 和全部常规 Rust 测试，不带 `--ignored`。也可用 `devenv tasks run …` 分别运行检查。binary 编译使用下述 `devenv build`。
+本地与 CI 均运行 `devenv test`：devenv 原生的 `devenv:git-hooks:run` 任务执行全文件 hooks（rustfmt / clippy / nixfmt / actionlint / cargo test），并运行需要真实挂载的 FUSE 冒烟测试。检查命令只在 `devenv.nix` 的 hooks 中维护，workflow 不另抄一套。无 FUSE 设备时可用 `devenv tasks run devenv:git-hooks:run` 单独运行常规检查；挂载测试可单独运行 `devenv tasks run feishufs:smoke-linux`。binary 编译使用下述 `devenv build`。
 
 也可在已配置的 Rust 环境中分别运行：
 
@@ -48,30 +48,38 @@ cargo test --locked --all-targets --all-features
 
 | 测试 | 入口 | 边界 |
 | --- | --- | --- |
-| Linux FUSE 冒烟 | `devenv tasks run feishufs:smoke-linux` | 需要 `/dev/fuse` 和挂载权限；使用假数据，不访问飞书 |
+| Linux FUSE 冒烟 | `devenv test` 或 `devenv tasks run feishufs:smoke-linux` | 需要 `/dev/fuse` 和挂载权限；使用假数据，不访问飞书 |
 | 真实内容读取 | `cargo test --test docs_ai_live -- --ignored --nocapture` | 明确授权后运行，所需变量和样例断言见 `tests/docs_ai_live.rs` |
 
-环境缺少 setuid fusermount 但允许 sudo 时，可用 `FEISHUFS_FUSE_SUDO=1 devenv tasks run feishufs:smoke-linux`。
-
-真实挂载和真实 API 测试均为 `ignored`，不会被常规测试触发。统一 [CI / release workflow](.github/workflows/ci.yml) 在 push、PR 和 tag 上执行同一组 Linux 检查与构建。
+真实 API 和 FUSE 测试均标记为 `ignored`，不会被普通 `cargo test` 触发。`devenv test` 只显式运行其中的 FUSE 冒烟，不调用真实 API。统一 [CI / release workflow](.github/workflows/ci.yml) 在 push、PR 和 tag 上执行 `devenv test` 与 binary 构建打包，因此提交者是否安装本地 hooks 不影响 CI 的检查范围。
 
 ## 发布 binary
 
-编译唯一定义在 [devenv.nix](devenv.nix) 中，`outputs` 只输出 binary，不生成压缩包或校验文件；[flake.nix](flake.nix) 通过 `lib.mkConfig` 复用其中的 Linux 输出。CI 使用独立 devenv CLI 执行检查与编译，直接在 workflow 的 `run:` 中打包，再交给 `softprops/action-gh-release` 发布，不另设打包脚本或 Nix 模块。只支持 x86_64 Linux 构建主机与运行平台。应用 derivation 不依赖本地 `.env` 或工作区状态。固定 `rust-toolchain.toml` 指定的工具链与 `Cargo.lock`，应用构建仅使用清单、锁文件和 `src/` Rust 源码。
+编译唯一定义在 [devenv.nix](devenv.nix) 中，`outputs` 输出 binary 及随附的许可声明，不生成压缩包或校验文件；[flake.nix](flake.nix) 通过 `lib.mkConfig` 复用其中的 Linux 输出。CI 使用独立 devenv CLI 执行 hooks、冒烟与编译，直接在 workflow 的 `run:` 中打包，再交给 `softprops/action-gh-release` 发布，不另设打包脚本或 Nix 模块。只支持 x86_64 Linux 构建主机与运行平台。应用 derivation 不依赖本地 `.env` 或工作区状态。固定 `rust-toolchain.toml` 指定的工具链与 `Cargo.lock`，应用构建仅使用清单、锁文件、`src/` Rust 源码及许可文件、生成配置 / 模板。
 
 本地编译 binary：
 
 ```bash
 devenv build outputs.feishufsLinux
-# stdout JSON 给出 store 路径，产物为 bin/feishufs
+# stdout JSON 给出 store 路径，产物为 bin/feishufs 和 share/licenses/feishufs/
 # flake package / app 复用同一静态 binary：
 nix build
 nix run .# -- --help
 ```
 
-Linux 使用静态 musl。CI 验证 binary 无 ELF interpreter / 动态依赖、版本及三个 CLI help，并将 binary 制作为 `.tar.gz` 与同名 `.sha256` 文件；压缩包内只有 binary、`LICENSE` 和 `.env.example`，并验证精确成员与 SHA-256。校验文件引用压缩包 basename，可在下载目录直接校验。
+Linux 使用静态 musl。CI 验证 binary 版本及三个 CLI help，并将 binary 制作为 `.tar.gz` 与同名 `.sha256` 文件；压缩包内包含 binary、`LICENSE`、`.env.example`、`THIRD_PARTY_LICENSES.html`、`RUST-STDLIB.html` 和 `MUSL-COPYRIGHT.txt`，并验证精确成员与 SHA-256。校验文件引用压缩包 basename，可在下载目录直接校验。
 
-统一 workflow 仅在推送 `v<版本>` tag 且与该提交的 `Cargo.toml` package version 完全一致时发布；PR（包括 forks）、分支及其他 tag 不进入发布 job。devenv 检查、binary 编译、验证及打包全部成功后，压缩包与校验文件以 artifact 传到独立发布 job，再由 `softprops/action-gh-release` 上传；构建 job 只有只读权限，发布 job 只有下载与 API 操作，不 checkout、构建或执行仓库代码。
+第三方许可在 Nix 构建中通过锁定版本的 `cargo-about` 离线生成，配置见 [`about.toml`](about.toml)，模板见 [`misc/third-party-licenses.hbs`](misc/third-party-licenses.hbs)。清单包含 Linux musl 目标的传递依赖；AWS-LC 的复合许可证保留原始声明，校验和变化时构建失败，升级依赖后须重新核对。Rust 标准库的版权文档来自锁定工具链，musl 的声明来自锁定 libc 源码。不要以仅含本项目 MIT 许可的自制包替代这些分发文件。
+
+在开发 shell 中可单独检查 Cargo 依赖许可（首次可能下载依赖）：
+
+```bash
+mkdir -p .cache
+cargo about generate --locked --fail misc/third-party-licenses.hbs \
+  --output-file .cache/THIRD_PARTY_LICENSES.html
+```
+
+统一 workflow 仅在推送 `v<版本>` tag 时发布；PR（包括 forks）、分支及其他 tag 不进入发布 job。CI 在构建前检查 tag 必须与该提交的 `Cargo.toml` 版本完全一致，不依赖本地 pre-push hook。hooks、FUSE 冒烟、binary 编译、验证及打包全部成功后，压缩包与校验文件以 artifact 传到独立发布 job，再由 `softprops/action-gh-release` 上传；构建 job 只有只读权限，发布 job 只有下载与 API 操作，不 checkout、构建或执行仓库代码。
 
 确认发布提交已推送、版本正确且 `origin` 已配置为发布仓库后，创建并推送对应 tag（以下以 `0.1.0` 为例）：
 
@@ -96,6 +104,6 @@ Git hooks 依赖开发环境中的 `cc`、`cargo` 等工具。提交时使用 `d
 - README 负责产品介绍与用法，其他文档分工见 [文档索引](README.md#文档)。一个事实只保留一个主位置，其他地方用链接引用。
 - 写当前能力、限制和理由，不保留“本轮”“本次已授权”等过程叙述。路线图区分候选、待验证和未决策略。
 - 构建、测试、关键不变量和长期技术决策随代码公开；易变的函数细节优先放代码注释与测试。
-- 临时实现笔记、调试记录和私有样例放 `docs/local/`，该目录已被 Git 忽略。忽略规则不保护已跟踪或强制添加的文件；需要共享的私密记录应使用独立私有存储。
+- 临时实现笔记、调试记录和私有样例放 `docs/local/`；本机诊断脚本放 `scripts/`。两处均被 Git 忽略，不作为公开构建或检查的依赖。忽略规则不保护已跟踪或强制添加的文件；需要共享的私密记录应使用独立私有存储。
 
 组织方式参考 GitHub 的 [README](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes) / [CONTRIBUTING](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/setting-guidelines-for-repository-contributors) 惯例、[Diátaxis 职责拆分](https://diataxis.fr/)和[精简架构说明](https://matklad.github.io/2021/02/06/ARCHITECTURE.md.html)。
