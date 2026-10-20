@@ -4,7 +4,7 @@
 
 ## 开发环境
 
-推荐在 x86_64 Linux 使用独立的 [devenv CLI](https://devenv.sh/getting-started/)：
+推荐在 x86_64 Linux 使用独立的 [devenv CLI](https://devenv.sh/getting-started/) 2.4.0（与 CI 一致；任务配置要求至少 2.3.2）：
 
 ```bash
 devenv shell

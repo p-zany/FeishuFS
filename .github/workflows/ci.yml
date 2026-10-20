@@ -32,7 +32,7 @@ jobs:
           name: devenv
           skipPush: true
       - name: Install pinned standalone devenv CLI
-        run: nix profile install github:cachix/devenv/2418e1b43797c44de5166176622c8d8fa0149871
+        run: nix profile install github:cachix/devenv/b904dcb51fe48c30db250038241507f60752f222 # v2.4.0
       - name: Validate release tag and derive prerelease flag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         id: tag
