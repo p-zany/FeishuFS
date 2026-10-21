@@ -10,7 +10,9 @@ use crate::{
 };
 
 const MAX_COMPONENT_BYTES: usize = 180;
-pub(crate) const ASSETS_DIRECTORY: &str = ".feishufs-assets";
+
+/// Name of the visible asset directory within a mounted or exported space.
+pub const ASSETS_DIRECTORY: &str = ".feishufs-assets";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AssetSpec {

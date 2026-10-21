@@ -7,15 +7,21 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Args, Parser, Subcommand};
-use feishufs::{FeishuFs, FsOptions, KnowledgeLink, OpenLarkOptions, OpenLarkSource, logging};
+use feishufs::{
+    ASSETS_DIRECTORY, FeishuFs, FsOptions, KnowledgeLink, OpenLarkOptions, OpenLarkSource, logging,
+};
 use fsk::{MountOptions, MountSession};
 use tracing::{debug, error, info};
+
+use crate::export::WriteMode;
+
+mod export;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "feishufs",
     version,
-    about = "Mount a Feishu/Lark space as a read-only filesystem"
+    about = "Mount or export a Feishu/Lark space as local files"
 )]
 struct Cli {
     #[arg(short, long, action = ArgAction::Count, global = true)]
@@ -39,6 +45,14 @@ enum Command {
     Inspect(CommonArgs),
     /// Mount a space at a local directory
     Mount(MountArgs),
+    /// Export a space to a new directory without mounting
+    ///
+    /// The destination must not exist. Parent directories are created as needed.
+    Export(OutputArgs),
+    /// Update local files once, overwriting matching paths and keeping extra files
+    ///
+    /// The destination is created if missing. Local edits at matching paths are overwritten.
+    Sync(OutputArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -78,7 +92,7 @@ struct CommonArgs {
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     content_retry_interval: Duration,
 
-    /// Maximum number of nodes in a mounted space
+    /// Maximum number of nodes in a space
     #[arg(long, default_value_t = 10_000)]
     max_nodes: usize,
 
@@ -102,6 +116,15 @@ struct MountArgs {
     /// Internal disk backing cache (default: the user's cache directory)
     #[arg(long = "cache-dir", alias = "asset-dir", value_name = "PATH")]
     cache_directory: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct OutputArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Local output directory
+    destination: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -139,7 +162,18 @@ fn run(command: Command, log_path: Option<PathBuf>) -> Result<()> {
             Ok(())
         }
         Command::Mount(args) => mount(args, log_path),
+        Command::Export(args) => copy_space(args, WriteMode::CreateNew),
+        Command::Sync(args) => copy_space(args, WriteMode::Update),
     }
+}
+
+fn copy_space(args: OutputArgs, mode: WriteMode) -> Result<()> {
+    let filesystem = connect(&args.common, None)?;
+    let copied = export::write(&filesystem, &args.destination, mode)?;
+    println!("Space: {}", filesystem.root_title());
+    println!("Files copied: {copied}");
+    println!("Output: {}", args.destination.display());
+    Ok(())
 }
 
 fn connect(args: &CommonArgs, asset_directory: Option<PathBuf>) -> Result<FeishuFs> {
@@ -198,7 +232,7 @@ fn mount(args: MountArgs, log_path: Option<PathBuf>) -> Result<()> {
     );
     println!(
         "Assets directory: {}",
-        args.mountpoint.join(".feishufs-assets").display()
+        args.mountpoint.join(ASSETS_DIRECTORY).display()
     );
     if let Some(path) = filesystem.asset_directory() {
         debug!(path = %path.display(), "Asset backing cache enabled");
@@ -327,6 +361,42 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_and_sync_help_describe_their_own_destination_policy() {
+        let create_new = "The destination must not exist.";
+        let update = "The destination is created if missing.";
+        for (command, expected, unrelated) in
+            [("export", create_new, update), ("sync", update, create_new)]
+        {
+            let error = Cli::try_parse_from(["feishufs", command, "--help"]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            let help = error.to_string();
+            assert!(help.contains(expected), "{help}");
+            assert!(!help.contains(unrelated), "{help}");
+            assert!(!help.contains("must not exist for export"), "{help}");
+        }
+    }
+
+    #[test]
+    fn export_and_sync_accept_a_destination_and_existing_connection_options() {
+        for command in ["export", "sync"] {
+            let result = Cli::try_parse_from([
+                "feishufs",
+                command,
+                "https://example.feishu.cn/wiki/doc",
+                "output",
+                "--app-id",
+                "test-app",
+                "--app-secret",
+                "test-secret",
+                "--max-download-mib",
+                "20",
+                "--no-log-file",
+            ]);
+            assert!(result.is_ok(), "{result:?}");
+        }
+    }
 
     #[test]
     fn directory_interval_and_content_ttl_are_independent() {

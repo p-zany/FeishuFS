@@ -18,3 +18,4 @@ pub use remote::{
     ContentAsset, ContentBundle, ContentRequest, RemoteNode, RemoteSource, RemoteSpace,
     RemoteSubtable, RemoteTree,
 };
+pub use tree::ASSETS_DIRECTORY;

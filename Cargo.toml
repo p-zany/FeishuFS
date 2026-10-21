@@ -1,9 +1,9 @@
 [package]
 name = "feishufs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
-description = "Mount a Feishu/Lark knowledge base as a read-only filesystem"
+description = "Read Feishu/Lark knowledge bases through a filesystem mount or local export"
 license = "MIT"
 publish = false
 

@@ -4,7 +4,7 @@
 
 ## Linux mount requirements
 
-FeishuFS supports x86_64 Linux and requires a usable `/dev/fuse`, permission to mount, and `fusermount3`. On Ubuntu / Debian:
+FeishuFS supports x86_64 Linux. `mount` requires a usable `/dev/fuse`, permission to mount, and `fusermount3`; `inspect`, `export`, and `sync` do not need these mount facilities. On Ubuntu / Debian:
 
 ```bash
 sudo apt-get update
@@ -17,11 +17,11 @@ See [Authorization](AUTHORIZATION.en.md) for app credentials and knowledge base 
 
 When [GitHub Releases](https://github.com/p-zany/feishufs/releases) provides a Linux archive for the version you want, download it together with its `.sha256` file, verify it, and extract it. If no release package is available yet, use Nix or build from source below.
 
-Release binaries are statically linked with musl and do not require Nix, Rust, the Feishu CLI, glibc, or `libgcc_s.so.1`. The FUSE requirements above still apply. This example uses `v0.1.0`; use the version matching your downloaded files:
+Release binaries are statically linked with musl and do not require Nix, Rust, the Feishu CLI, glibc, or `libgcc_s.so.1`. The FUSE requirements above still apply to `mount`. This example uses `v0.2.0`; use the version matching your downloaded files:
 
 ```bash
-sha256sum --check feishufs-v0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256 && \
-  tar -xzf feishufs-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+sha256sum --check feishufs-v0.2.0-x86_64-unknown-linux-musl.tar.gz.sha256 && \
+  tar -xzf feishufs-v0.2.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 From the extracted directory, configure credentials as shown in the [README quick start](../README.md#quick-start), then replace `nix run github:p-zany/feishufs --` with `./feishufs`:
@@ -54,6 +54,22 @@ cargo install --path . --locked
 
 Ensure `~/.cargo/bin` is in `PATH` to run `feishufs` directly. For Nix, see the [README quick start](../README.md#quick-start). For development checks and the release process, see [Contributing](../CONTRIBUTING.md) (Chinese).
 
+## One-shot export and sync
+
+Use the same credentials and knowledge base URL as for mounting to write the entire visible space to ordinary local files and exit, without FUSE:
+
+```bash
+# First export: the destination must not exist; parent directories are created
+feishufs export 'https://example.feishu.cn/wiki/wikcnxxx' ./wiki
+
+# Update: overwrite matching files and add new files; create the directory if missing
+feishufs sync 'https://example.feishu.cn/wiki/wikcnxxx' ./wiki
+```
+
+`sync` overwrites local edits at matching paths, keeps extra files, and never writes back to Feishu. Every run fetches a fresh directory and all readable content, using the mount's file formats and relative links. Failures return a nonzero exit code and may leave completed files in place; fix the cause and run `sync` to retry. See [export and sync limitations](PRODUCT.md#一次性导出与同步) (Chinese).
+
+Each file is replaced only after it has been fully copied; the whole directory is not a transaction. Existing symlinks at the destination or within the copied tree are rejected. Remote deletions and renames can leave old files or assets behind. Content remains cached in memory during the run, and embedded objects retain the existing conversion limitations; this is not a complete offline backup of every Feishu page.
+
 ## Common options
 
 | Option | Default | Meaning |
@@ -70,7 +86,9 @@ Assets are exposed under `<mountpoint>/.feishufs-assets`, for example `wiki/.fei
 
 Durations accept values such as `60s` or `5m` and must be greater than zero. `inspect` accepts these options but does not refresh in the background. Failed directory refreshes back off to 2, 4, and 8 times the normal interval, returning to normal after success. Failed content fetches are retried on the next access after the cooldown expires.
 
-For all options, run `--help`, `inspect --help`, or `mount --help`.
+`export` / `sync` reuse the connection and download limits above. They do not start background refreshes or refetch already-read content based on TTL; `--refresh-interval`, `--content-ttl`, and `--content-retry-interval` do not schedule exports. They do not create the mount's internal disk cache.
+
+For all options, run `--help` or any subcommand's `--help`.
 
 ## Logging and troubleshooting
 

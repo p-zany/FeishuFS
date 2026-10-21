@@ -67,7 +67,7 @@ nix build
 nix run .# -- --help
 ```
 
-Linux 使用静态 musl。CI 验证 binary 版本及三个 CLI help，并将 binary 制作为 `.tar.gz` 与同名 `.sha256` 文件；压缩包内包含 binary、`LICENSE`、`.env.example`、`THIRD_PARTY_LICENSES.html`、`RUST-STDLIB.html` 和 `MUSL-COPYRIGHT.txt`，并验证精确成员与 SHA-256。校验文件引用压缩包 basename，可在下载目录直接校验。
+Linux 使用静态 musl。CI 验证 binary 版本、顶层及各子命令的 help，并将 binary 制作为 `.tar.gz` 与同名 `.sha256` 文件；压缩包内包含 binary、`LICENSE`、`.env.example`、`THIRD_PARTY_LICENSES.html`、`RUST-STDLIB.html` 和 `MUSL-COPYRIGHT.txt`，并验证精确成员与 SHA-256。校验文件引用压缩包 basename，可在下载目录直接校验。
 
 第三方许可在 Nix 构建中通过锁定版本的 `cargo-about` 离线生成，配置见 [`about.toml`](about.toml)，模板见 [`misc/third-party-licenses.hbs`](misc/third-party-licenses.hbs)。清单包含 Linux musl 目标的传递依赖；AWS-LC 的复合许可证保留原始声明，校验和变化时构建失败，升级依赖后须重新核对。Rust 标准库的版权文档来自锁定工具链，musl 的声明来自锁定 libc 源码。不要以仅含本项目 MIT 许可的自制包替代这些分发文件。
 
@@ -81,11 +81,11 @@ cargo about generate --locked --fail misc/third-party-licenses.hbs \
 
 统一 workflow 仅在推送 `v<版本>` tag 时发布；PR（包括 forks）、分支及其他 tag 不进入发布 job。CI 在构建前检查 tag 必须与该提交的 `Cargo.toml` 版本完全一致，不依赖本地 pre-push hook。hooks、FUSE 冒烟、binary 编译、验证及打包全部成功后，压缩包与校验文件以 artifact 传到独立发布 job，再由 `softprops/action-gh-release` 上传；构建 job 只有只读权限，发布 job 只有下载与 API 操作，不 checkout、构建或执行仓库代码。
 
-确认发布提交已推送、版本正确且 `origin` 已配置为发布仓库后，创建并推送对应 tag（以下以 `0.1.0` 为例）：
+确认发布提交已推送、版本正确且 `origin` 已配置为发布仓库后，创建并推送对应 tag（以下以 `0.2.0` 为例）：
 
 ```bash
-git tag -a v0.1.0 -m 'Release v0.1.0'
-git push origin v0.1.0
+git tag -a v0.2.0 -m 'Release v0.2.0'
+git push origin v0.2.0
 ```
 
 版本含 `-rc.1` 等 prerelease 后缀时，发布为预发布且不标为 Latest。Workflow 在发布前确认远端 tag 仍指向触发提交、release 尚不存在，不移动 tag、不覆盖已有 release 或同名附件；失败后先检查 Actions 日志与 Releases 状态，没有 release 时可重跑，已有 release 时停止并人工检查，不移动已发布 tag。运行依赖和下载用法见[使用指南](docs/USAGE.md#使用发布包)。

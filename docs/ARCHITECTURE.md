@@ -11,6 +11,8 @@ CLI / 环境变量
   → RemoteTree → FsState 构建目录快照
   → FeishuFs → FSK → Linux FUSE
 
+export / sync → FeishuFs → 遍历与读取 → 普通本地文件
+
 文件访问 → 按需获取内容 → XML / 导出 / 下载 → 资产原子落盘 → 缓存与本地链接渲染
 后台刷新 → 完整目录快照 → 比较并发布
 ```
@@ -35,6 +37,7 @@ CLI / 环境变量
 | 模块 | 职责 |
 | --- | --- |
 | `main.rs` | CLI、连接、挂载与退出 |
+| `export.rs` | CLI 的一次性文件复制；复用 FSK 读取接口，正文后再复制资产，单文件原子替换 |
 | `link.rs` | 官方链接解析及 API 域名选择 |
 | `remote.rs` | `RemoteSource` 边界、远端模型、空间遍历与子表清单校验 |
 | `openlark.rs` / `sdk_error.rs` | SDK 适配、XML 获取、文件 / 画板下载、CSV 导出及错误链 |

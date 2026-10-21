@@ -63,6 +63,8 @@ jobs:
           "$linux/bin/feishufs" --help
           "$linux/bin/feishufs" inspect --help
           "$linux/bin/feishufs" mount --help
+          "$linux/bin/feishufs" export --help
+          "$linux/bin/feishufs" sync --help
           # Package only the binary, public templates and license notices.
           assets="$PWD/.cache/release"
           linux_bundle=$(mktemp -d "$RUNNER_TEMP/feishufs-linux.XXXXXX")

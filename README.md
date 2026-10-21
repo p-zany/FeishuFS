@@ -10,6 +10,8 @@ Mount a Feishu / Lark knowledge base as a local, read-only filesystem so AI agen
 
 Currently supports **x86_64 Linux**. A document link selects its **entire visible knowledge space**, not just that document. Access is read-only; local changes are never synced back to Feishu.
 
+Use [`export` / `sync`](docs/USAGE.en.md#one-shot-export-and-sync) to write ordinary local files and exit, without FUSE.
+
 ## Quick start
 
 ### 1. Prepare the environment and access

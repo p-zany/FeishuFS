@@ -4,7 +4,7 @@
 
 ## Linux 挂载条件
 
-支持 x86_64 Linux，需要可用的 `/dev/fuse`、挂载权限和 `fusermount3`。Ubuntu / Debian 可安装：
+支持 x86_64 Linux，`mount` 需要可用的 `/dev/fuse`、挂载权限和 `fusermount3`；`inspect`、`export` 和 `sync` 不需要这些挂载条件。Ubuntu / Debian 可安装：
 
 ```bash
 sudo apt-get update
@@ -17,11 +17,11 @@ sudo apt-get install fuse3
 
 当 [GitHub Releases](https://github.com/p-zany/feishufs/releases) 提供对应版本的 Linux 压缩包时，可下载压缩包与同名 `.sha256` 文件，校验后解压。尚无发布包时，请使用 Nix 或下方的源码构建。
 
-发布包采用静态 musl 链接，无需 Nix、Rust、飞书 CLI、glibc 或 `libgcc_s.so.1`，仍需上述 FUSE 条件。以下以 `v0.1.0` 为例，版本号应与下载文件一致：
+发布包采用静态 musl 链接，无需 Nix、Rust、飞书 CLI、glibc 或 `libgcc_s.so.1`，`mount` 仍需上述 FUSE 条件。以下以 `v0.2.0` 为例，版本号应与下载文件一致：
 
 ```bash
-sha256sum --check feishufs-v0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256 && \
-  tar -xzf feishufs-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+sha256sum --check feishufs-v0.2.0-x86_64-unknown-linux-musl.tar.gz.sha256 && \
+  tar -xzf feishufs-v0.2.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 在解压目录中，按 [README 的快速开始](../README.zh-CN.md#快速开始)配置凭证，将命令中的 `nix run github:p-zany/feishufs --` 替换为 `./feishufs`：
@@ -54,6 +54,20 @@ cargo install --path . --locked
 
 确保 `~/.cargo/bin` 在 `PATH` 中，即可直接运行 `feishufs`。Nix 用户见 [README 的快速开始](../README.zh-CN.md#快速开始)；本地构建、开发检查及发布流程见[贡献指南](../CONTRIBUTING.md)。
 
+## 一次性导出与同步
+
+使用与挂载相同的凭证和知识库链接，把整个可见空间写入普通本地目录，完成后退出，无需 FUSE：
+
+```bash
+# 首次导出：目标目录必须不存在，父目录会自动创建
+feishufs export 'https://example.feishu.cn/wiki/wikcnxxx' ./wiki
+
+# 后续更新：覆盖同路径文件、补充新文件，目标目录不存在时自动创建
+feishufs sync 'https://example.feishu.cn/wiki/wikcnxxx' ./wiki
+```
+
+`sync` 会覆盖同路径文件的本地修改，不删除旧文件，不回写飞书。每次运行重新获取目录和全部可读取内容；文件格式和相对链接沿用挂载规则。失败时退出码为非零，并可能留下已完成的部分文件；可修复原因后运行 `sync`。完整边界见[一次性导出与同步](PRODUCT.md#一次性导出与同步)。
+
 ## 常用参数
 
 | 参数 | 默认值 | 含义 |
@@ -70,7 +84,9 @@ cargo install --path . --locked
 
 时间参数接受 `60s`、`5m` 等格式，必须大于零。`inspect` 也接受这些参数，但不执行后台刷新。目录失败后的等待间隔按 2、4、8 倍退避，成功后恢复；内容在冷却结束后的下一次访问重试。
 
-完整选项见 `--help`、`inspect --help` 和 `mount --help`。
+`export` / `sync` 复用上述连接和下载限制，不启动后台刷新，也不按 TTL 重复获取已读取内容；`--refresh-interval`、`--content-ttl` 和 `--content-retry-interval` 不控制导出周期。它们不创建挂载的内部磁盘缓存。
+
+完整选项见 `--help` 及各子命令的 `--help`。
 
 ## 日志与排障
 
