@@ -28,9 +28,9 @@
 export FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
 export FEISHU_APP_SECRET=replace-me
 
-nix run github:p-zany/feishufs -- inspect 'https://example.feishu.cn/wiki/wikcnxxx'
+nix run github:p-zany/FeishuFS -- inspect 'https://example.feishu.cn/wiki/wikcnxxx'
 mkdir -p ./mnt
-nix run github:p-zany/feishufs -- mount 'https://example.feishu.cn/wiki/wikcnxxx' ./mnt
+nix run github:p-zany/FeishuFS -- mount 'https://example.feishu.cn/wiki/wikcnxxx' ./mnt
 ```
 
 挂载以前台进程运行，按 `Ctrl-C` 卸载。Lark 链接自动使用 Lark API。`inspect` 只预览目录和子表元信息，不验证所有正文 / 图片的读取权限。

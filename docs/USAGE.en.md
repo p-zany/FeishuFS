@@ -15,7 +15,7 @@ See [Authorization](AUTHORIZATION.en.md) for app credentials and knowledge base 
 
 ## Use a release package
 
-When [GitHub Releases](https://github.com/p-zany/feishufs/releases) provides a Linux archive for the version you want, download it together with its `.sha256` file, verify it, and extract it. If no release package is available yet, use Nix or build from source below.
+When [GitHub Releases](https://github.com/p-zany/FeishuFS/releases) provides a Linux archive for the version you want, download it together with its `.sha256` file, verify it, and extract it. If no release package is available yet, use Nix or build from source below.
 
 Release binaries are statically linked with musl and do not require Nix, Rust, the Feishu CLI, glibc, or `libgcc_s.so.1`. The FUSE requirements above still apply to `mount`. This example uses `v0.2.0`; use the version matching your downloaded files:
 
@@ -24,7 +24,7 @@ sha256sum --check feishufs-v0.2.0-x86_64-unknown-linux-musl.tar.gz.sha256 && \
   tar -xzf feishufs-v0.2.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
-From the extracted directory, configure credentials as shown in the [README quick start](../README.md#quick-start), then replace `nix run github:p-zany/feishufs --` with `./feishufs`:
+From the extracted directory, configure credentials as shown in the [README quick start](../README.md#quick-start), then replace `nix run github:p-zany/FeishuFS --` with `./feishufs`:
 
 ```bash
 ./feishufs inspect 'https://example.feishu.cn/wiki/wikcnxxx'
@@ -44,7 +44,7 @@ sudo apt-get install build-essential pkg-config libfuse3-dev fuse3
 cargo build --release --locked
 ```
 
-The binary is at `target/release/feishufs`. Configure credentials as shown in the [README quick start](../README.md#quick-start), then replace `nix run github:p-zany/feishufs --` with `./target/release/feishufs`.
+The binary is at `target/release/feishufs`. Configure credentials as shown in the [README quick start](../README.md#quick-start), then replace `nix run github:p-zany/FeishuFS --` with `./target/release/feishufs`.
 
 You can also install into Cargo's binary directory:
 

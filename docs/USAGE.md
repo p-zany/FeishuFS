@@ -15,7 +15,7 @@ sudo apt-get install fuse3
 
 ## 使用发布包
 
-当 [GitHub Releases](https://github.com/p-zany/feishufs/releases) 提供对应版本的 Linux 压缩包时，可下载压缩包与同名 `.sha256` 文件，校验后解压。尚无发布包时，请使用 Nix 或下方的源码构建。
+当 [GitHub Releases](https://github.com/p-zany/FeishuFS/releases) 提供对应版本的 Linux 压缩包时，可下载压缩包与同名 `.sha256` 文件，校验后解压。尚无发布包时，请使用 Nix 或下方的源码构建。
 
 发布包采用静态 musl 链接，无需 Nix、Rust、飞书 CLI、glibc 或 `libgcc_s.so.1`，`mount` 仍需上述 FUSE 条件。以下以 `v0.2.0` 为例，版本号应与下载文件一致：
 
@@ -24,7 +24,7 @@ sha256sum --check feishufs-v0.2.0-x86_64-unknown-linux-musl.tar.gz.sha256 && \
   tar -xzf feishufs-v0.2.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
-在解压目录中，按 [README 的快速开始](../README.zh-CN.md#快速开始)配置凭证，将命令中的 `nix run github:p-zany/feishufs --` 替换为 `./feishufs`：
+在解压目录中，按 [README 的快速开始](../README.zh-CN.md#快速开始)配置凭证，将命令中的 `nix run github:p-zany/FeishuFS --` 替换为 `./feishufs`：
 
 ```bash
 ./feishufs inspect 'https://example.feishu.cn/wiki/wikcnxxx'
@@ -44,7 +44,7 @@ sudo apt-get install build-essential pkg-config libfuse3-dev fuse3
 cargo build --release --locked
 ```
 
-产物为 `target/release/feishufs`。按 [README 的快速开始](../README.zh-CN.md#快速开始)配置凭证，将其中的 `nix run github:p-zany/feishufs --` 替换为 `./target/release/feishufs`。
+产物为 `target/release/feishufs`。按 [README 的快速开始](../README.zh-CN.md#快速开始)配置凭证，将其中的 `nix run github:p-zany/FeishuFS --` 替换为 `./target/release/feishufs`。
 
 也可安装到 Cargo 的二进制目录：
 

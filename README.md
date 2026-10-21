@@ -28,9 +28,9 @@ Replace the example credentials and URL with your own. Supply credentials throug
 export FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
 export FEISHU_APP_SECRET=replace-me
 
-nix run github:p-zany/feishufs -- inspect 'https://example.feishu.cn/wiki/wikcnxxx'
+nix run github:p-zany/FeishuFS -- inspect 'https://example.feishu.cn/wiki/wikcnxxx'
 mkdir -p ./mnt
-nix run github:p-zany/feishufs -- mount 'https://example.feishu.cn/wiki/wikcnxxx' ./mnt
+nix run github:p-zany/FeishuFS -- mount 'https://example.feishu.cn/wiki/wikcnxxx' ./mnt
 ```
 
 The mount runs in the foreground; press `Ctrl-C` to unmount. Lark URLs automatically select the Lark API. `inspect` previews directory and subtable metadata only; it does not verify access to every document body or image.
